@@ -168,3 +168,21 @@ def test_paper_aligned_defaults_are_exposed_in_system_config() -> None:
     assert system.rl.grad_updates_per_cycle == 5
     assert system.env_driver.control_frequency_hz == 50.0
     assert system.env_driver.replay_request_timeout_sec == 30.0
+
+
+def test_groot_nero_example_is_26d_and_fail_closed() -> None:
+    path = ROOT / "configs" / "tasks" / "groot_nero" / "online_rl.example.yaml"
+
+    system = load_system_config_yaml(str(path))
+
+    assert system.rl.action_dim == 26
+    assert system.rl.proprio_dim == 26
+    assert system.rl.z_dim == 2048
+    assert system.rl.chunk_len == 10
+    assert system.rl.action_representation == "abs"
+    assert system.rl.delta_action_indices == ()
+    assert system.rl.action_norm_stats_path == "/REPLACE_WITH_EXPORTED/groot_online_action_stats.json"
+    assert system.rl.action_layout_hash == "sha256:REPLACE_WITH_ACTION_LAYOUT_HASH"
+    assert system.rl.proprio_layout_hash == "sha256:REPLACE_WITH_PROPRIO_LAYOUT_HASH"
+    assert system.env_driver.machine_a_ws_url == "ws://MACHINE_A_IP:8000"
+    assert system.env_driver.enable_human_override is False

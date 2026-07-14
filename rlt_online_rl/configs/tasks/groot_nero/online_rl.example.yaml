@@ -1,0 +1,110 @@
+# Groot/Nero 26D starting point only. This file is intentionally fail-closed:
+# replace every REPLACE_* value and supply --env-factory before a robot run.
+experiment:
+  rl:
+    action_dim: 26
+    chunk_len: 10
+    z_dim: 2048
+    proprio_dim: 26
+
+    # The current exporter emits physical absolute actions. Do not change this
+    # to delta_chunk without recomputing statistics in the transformed space.
+    action_representation: abs
+    action_norm_stats_path: /REPLACE_WITH_EXPORTED/groot_online_action_stats.json
+    action_layout_hash: "sha256:REPLACE_WITH_ACTION_LAYOUT_HASH"
+    proprio_layout_hash: "sha256:REPLACE_WITH_PROPRIO_LAYOUT_HASH"
+    delta_action_indices: []
+
+    gamma: 0.99
+    fixed_std: 0.05
+    reference_dropout_prob: 0.5
+    delta_weight: 0.0
+    warmup_bc_weight: 1.0
+    warmup_q_weight: 1.0
+    online_bc_weight: 1.0
+    online_q_weight: 1.0
+
+    actor_hidden_dim: 256
+    actor_num_layers: 2
+    critic_hidden_dim: 256
+    critic_num_layers: 2
+
+    actor_lr: 0.0003
+    critic_lr: 0.0003
+    target_tau: 0.005
+    actor_update_period: 2
+
+    warmup_min_size: 1000
+    warmup_post_collect_updates: null
+    freeze_after_warmup: false
+    grad_updates_per_cycle: 5
+
+runtime:
+  role: all
+  local_debug_mode: false
+
+  monitoring:
+    enable_wandb: false
+    wandb_project: groot-rlt-online
+    wandb_entity: null
+    wandb_mode: offline
+    wandb_run_name: groot_nero
+    wandb_dir: ./runs/groot_nero/wandb
+
+  actor_service:
+    pull_params_interval_sec: 0.25
+    rpc_timeout_sec: 0.2
+    bind_host: 127.0.0.1
+    port: 9101
+    snapshot_path: ./runs/groot_nero/actor_snapshot/actor_snapshot.pkl
+    xla_mem_fraction: 0.10
+    xla_preallocate: false
+
+  learner_service:
+    push_actor_interval_steps: 50
+    checkpoint_interval_steps: 1000
+    sample_batch_size: 256
+    checkpoint_dir: ./runs/groot_nero/checkpoints
+    actor_snapshot_path: ./runs/groot_nero/actor_snapshot/actor_snapshot.pkl
+    replay_url: http://127.0.0.1:9102
+    poll_interval_sec: 0.01
+    xla_mem_fraction: 0.75
+    xla_preallocate: false
+
+  replay:
+    capacity: 200000
+    journal_path: ./runs/groot_nero/replay/replay_journal.pkl
+    bind_host: 127.0.0.1
+    port: 9102
+    seed: 0
+    sample_strategy: stratified
+    recent_episode_window: 20
+    recent_online_ratio: 0.4
+    warmup_demo_ratio: 0.3
+    human_intervention_ratio: 0.2
+
+  env_driver:
+    # Replace with the GR00T Machine-A address. The literal placeholder should
+    # never resolve on a correctly configured network.
+    machine_a_ws_url: ws://MACHINE_A_IP:8000
+    actor_service_url: http://127.0.0.1:9101
+    replay_service_url: http://127.0.0.1:9102
+    task_mode: critical_phase
+    episode_start_control_mode: policy
+    full_task_reset_action: null
+    critical_phase_reset_action: null
+    actor_deterministic: false
+    chunk_exec_horizon: 10
+    control_frequency_hz: 50.0
+    step_trace_stride: 2
+
+    # The current GR00T feature backend advertises supports_batch=false, so the
+    # client falls back to individual reconstruction requests.
+    replay_feature_batch_size: 16
+    enable_human_override: false
+    safe_fallback_to_ref: true
+    machine_a_connect_timeout_sec: 5.0
+    machine_a_recv_timeout_sec: 5.0
+    machine_a_retry_interval_sec: 0.5
+    actor_request_timeout_sec: 1.0
+    replay_request_timeout_sec: 30.0

@@ -1,9 +1,9 @@
-# GR00T RLT Integration
+# Groot-RLT
 
-`groot_rlt` is the Python 3.10 integration layer between Isaac-GR00T N1.7 and
-this repository's RLT implementation. It keeps GR00T/Cosmos dependencies out
-of the openpi Python 3.11 environment while exposing the same Machine-A
-contract used by `rlt_online_rl`.
+`groot_rlt` is the primary Python 3.10 integration layer between Isaac-GR00T
+N1.7 and this repository's RLT implementation. It keeps GR00T/Cosmos
+dependencies out of the retained openpi Python 3.11 environment while exposing
+the Machine-A contract used by `rlt_online_rl`.
 
 The package contains three deliberately separate pieces:
 
@@ -11,6 +11,12 @@ The package contains three deliberately separate pieces:
 2. A strict NumPy/PyTorch episode, replay, and actor-critic implementation.
 3. A GR00T feature server that returns `z_rl`, physical-space VLA reference
    chunks, and proprio to the existing online-RL runtime.
+
+The first two pieces are usable without a robot. The third is a tested software
+contract, not a claim that the current 26D robot/teleop path has passed an
+end-to-end hardware rollout. See the root
+[README](../README.md) and [Teleop integration contract](../docs/groot_teleop_integration.md)
+for the current deployment boundary.
 
 ## Environment boundary
 
@@ -22,6 +28,8 @@ version. Install it into the Isaac-GR00T environment:
 cd /home/whf/Project/Isaac-GR00T
 uv pip install --python .venv/bin/python \
   -e '/home/whf/Project/RLT/groot_rlt[groot,data,serve,dev]'
+
+.venv/bin/groot-rlt --help
 ```
 
 The GR00T checkout is resolved in this order:
@@ -52,22 +60,34 @@ The PyTorch core has no dependency on GR00T model code. Importing
 `groot_rlt` only requires NumPy and PyTorch. GR00T is loaded lazily by the
 representation and serving entry points.
 
-## Representation commands
+## Unified command
 
-The following commands replace the former scripts under
-`Isaac-GR00T/examples/IsaacLab`:
+`groot-rlt` is the primary entry point. It lazily dispatches to the existing
+tools, so displaying help does not load GR00T/Cosmos or require a GPU:
 
 ```bash
-groot-rlt-train-token --help
-groot-rlt-evaluate-token --help
-groot-rlt-precompute --help
-groot-rlt-visualize-token --help
+groot-rlt train-token --help
+groot-rlt evaluate-token --help
+groot-rlt precompute --help
+groot-rlt visualize-token --help
+groot-rlt serve-features --help
+groot-rlt export-online-stats --help
 ```
+
+The former `groot-rlt-train-token`, `groot-rlt-evaluate-token`,
+`groot-rlt-precompute`, `groot-rlt-visualize-token`,
+`groot-rlt-serve-features`, and `groot-rlt-export-online-stats` executables are
+retained as compatibility aliases.
+
+## Representation commands
+
+These commands replace the former scripts under
+`Isaac-GR00T/examples/IsaacLab`.
 
 Example two-stage representation training:
 
 ```bash
-groot-rlt-train-token \
+groot-rlt train-token \
   --groot-repo-path /home/whf/Project/Isaac-GR00T \
   --precompute-vl-embeddings \
   --embedding-cache-dir /home/whf/Project/Isaac-GR00T/outputs/IsaacLab/vl_embedding_cache \
@@ -80,7 +100,7 @@ groot-rlt-train-token \
   --device cuda \
   --load-bf16
 
-groot-rlt-train-token \
+groot-rlt train-token \
   --groot-repo-path /home/whf/Project/Isaac-GR00T \
   --embedding-cache-dir /home/whf/Project/Isaac-GR00T/outputs/IsaacLab/vl_embedding_cache \
   --output-dir /home/whf/Project/Isaac-GR00T/outputs/IsaacLab/vl_embedding_autoencoder \
@@ -101,7 +121,7 @@ The feature server uses one GR00T backbone pass for both the action chunk and
 the RL token:
 
 ```bash
-groot-rlt-serve-features \
+groot-rlt serve-features \
   --groot-repo-path /home/whf/Project/Isaac-GR00T \
   --model-path <checkpoint-directory> \
   --processor-path <processor-directory> \
@@ -137,6 +157,12 @@ The server accepts either native GR00T observations or the RLT flat wire shape
 split strictly as `eef_9d[9] + hand_joint_pos[10] + arm_joint_pos[7]`. Use
 `--image-key SOURCE=TARGET` for camera-name differences and
 `--flat-state-field KEY=DIM` for any non-Nero layout.
+
+This implementation intentionally calls the N1.7
+`prepare_input -> backbone -> action_head` path so `z_rl` is encoded from the
+raw backbone features before the action head mutates them. These are
+version-sensitive GR00T APIs; a future GR00T release or checkpoint must pass a
+real-checkpoint smoke test before the server is used for collection.
 
 `ref_chunk` is processor-decoded physical-space action. Do not treat it as an
 already normalized actor input. `rlt_online_rl.ActionRepresentationAdapter`
@@ -191,7 +217,7 @@ dataset. The exporter validates the state-as-action aliases and writes the
 strict `eef_9d[9] + hand_joint_target[10] + arm_joint_target[7]` layout:
 
 ```bash
-groot-rlt-export-online-stats \
+groot-rlt export-online-stats \
   --dataset-dir /path/to/mission2/smooth \
   --normalization-mode symmetric_quantile \
   --output /path/to/nero_rlt_online_action_stats.json
@@ -224,6 +250,11 @@ The strict schema preserves decision/sample time, VLA horizon, valid masks,
 critical phase, behavior/reference provenance, intervention masks, and sparse
 terminal labels. See [episode_schema.md](episode_schema.md) for the on-disk
 format.
+
+Teleop's current RLT sidecar exporter is only a handoff format: its RL-token
+tensors are empty and its VLA reference keys are unset. Enrich and validate
+those sidecars with the exact frozen GR00T/RL-token checkpoints before building
+warmup replay.
 
 ## Historical artifact compatibility
 

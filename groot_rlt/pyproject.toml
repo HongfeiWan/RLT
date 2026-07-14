@@ -31,6 +31,7 @@ dev = [
 ]
 
 [project.scripts]
+groot-rlt = "groot_rlt.cli:main"
 groot-rlt-train-token = "groot_rlt.representation.train_vl_embedding_autoencoder:main"
 groot-rlt-evaluate-token = "groot_rlt.representation.evaluate_vl_embedding_autoencoder_ablation:main"
 groot-rlt-precompute = "groot_rlt.representation.precompute_rl_tokens_and_vla_actions:main"

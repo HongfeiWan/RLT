@@ -1,9 +1,9 @@
 # RLT Online RL Runtime
 
 This README describes the `rlt_online_rl` runtime: the lightweight online RL
-system used after the openpi/RLT model has been trained and served. The root
-[README](../README.md) covers the project overview, demo videos, RLT/openpi
-relationship, contributors, and citation template.
+system used after a frozen VLA/RL-token model has been trained and served. The
+root [README](../README.md) defines GR00T as this checkout's primary backend;
+the historical openpi path remains available for the Agilex experiment.
 
 `rlt_online_rl` implements the robot-facing online learning loop:
 
@@ -13,8 +13,10 @@ relationship, contributors, and citation template.
 - a robot rollout driver that connects ROS observations, Machine A, the actor,
   replay, manual signals, reset, and evaluation
 
-The current public task configuration is `configs/tasks/agilex_ethernet`, which
-demonstrates Ethernet insertion on a real robot.
+The validated legacy task configuration is `configs/tasks/agilex_ethernet`,
+which demonstrates Ethernet insertion on a real robot. The GR00T/Nero file at
+`configs/tasks/groot_nero/online_rl.example.yaml` is intentionally a
+fail-closed starting template, not a validated robot configuration.
 
 ## Scope
 
@@ -29,17 +31,18 @@ This package owns the online RL runtime:
 - warmup, online rollout, human takeover, critical-phase handoff, and eval-only
   execution
 
-It does not train the base VLA or the RL-token module. Those live in the root
-openpi stack, mainly `src/openpi`, `scripts/train_rlt.py`, and
-`scripts/serve_rlt_policy.py`.
+It does not train the base VLA or the RL-token module. The primary GR00T tools
+live in `groot_rlt`; the retained openpi tools live in `src/openpi` and
+`scripts/train_rlt.py`.
 
 ## Runtime Architecture
 
-Machine A runs the frozen openpi/RLT policy server. For each observation it
-returns:
+Machine A runs either the primary GR00T/RLT feature server or the retained
+openpi/RLT policy server. For each observation it returns:
 
 - `z_rl`: the compact RL-token feature
 - `ref_chunk`: the VLA reference action chunk
+- `proprio`: optionally supplied by GR00T for native nested state observations
 
 Machine B runs:
 
@@ -64,8 +67,9 @@ At each chunk boundary:
 
 1. The rollout adapter reads the current robot observation.
 2. The observation is sent to Machine A.
-3. Machine A returns `z_rl` and `ref_chunk`.
-4. The rollout derives `proprio` from the local observation state.
+3. Machine A returns `z_rl`, `ref_chunk`, and optionally `proprio`.
+4. The rollout uses server `proprio` for nested GR00T state, otherwise it
+   derives it from the local flat observation state.
 5. During warmup or non-critical full-task prefixes, the robot executes
    `ref_chunk` directly.
 6. During online critical-phase control, Machine B actor receives
@@ -183,7 +187,7 @@ first `min(6, action_dim)` channels. Non-contiguous indices can be supplied for
 GR00T/Nero layouts.
 
 For Nero, generate the 26D file with
-`groot-rlt-export-online-stats`; do not point this field directly at GR00T's
+`groot-rlt export-online-stats`; do not point this field directly at GR00T's
 grouped `statistics.json` or the raw 19D LeRobot action stats. The loader honors
 the export's declared `lower_key`/`upper_key`, including symmetric `min`/`max`
 bounds, and can verify `action_layout_hash`/`proprio_layout_hash` before use.
@@ -232,7 +236,8 @@ replay.
 Use a separate Python 3.10 environment for the online RL runtime:
 
 ```bash
-cd openpi-RLT/rlt_online_rl
+export RLT_ROOT=/home/whf/Project/RLT
+cd "$RLT_ROOT/rlt_online_rl"
 conda create -y -n rlt_online_rl310 python=3.10 pip
 conda activate rlt_online_rl310
 python -m pip install --upgrade pip setuptools wheel
@@ -255,19 +260,38 @@ python -m pip install -e '.[monitor]'
 
 ## Launching Training
 
-Start the Machine B services:
+Start the Machine B services with an explicit task config. For GR00T/Nero,
+first replace every `REPLACE_*` value in the example; it is designed to fail
+before training when statistics/layout metadata are still missing:
 
 ```bash
-cd openpi-RLT/rlt_online_rl
+cd "$RLT_ROOT/rlt_online_rl"
 conda activate rlt_online_rl310
 python launch/launch_machine_b.py \
-  --config configs/tasks/agilex_ethernet/online_rl.yaml
+  --config configs/tasks/groot_nero/online_rl.example.yaml
 ```
 
-Start Machine A from the repository root after an RLT checkpoint is available:
+Start the primary GR00T Machine A in the Isaac-GR00T environment:
 
 ```bash
-cd openpi-RLT
+cd /home/whf/Project/Isaac-GR00T
+.venv/bin/groot-rlt serve-features \
+  --groot-repo-path /home/whf/Project/Isaac-GR00T \
+  --model-path <groot-checkpoint> \
+  --processor-path <processor-directory> \
+  --vlm-model-path <Cosmos-Reason2-2B> \
+  --rl-token-checkpoint <rl-token-checkpoint.pt> \
+  --action-dim 26 \
+  --proprio-dim 26 \
+  --chunk-len 10 \
+  --denoise-steps 32 \
+  --port 8000
+```
+
+The retained openpi Machine A is still available for the legacy Agilex task:
+
+```bash
+cd "$RLT_ROOT"
 python scripts/serve_rlt_policy.py \
   --config rlt_pi05_agilexbag_image_delta_joint \
   --checkpoint-dir <checkpoint-dir> \
@@ -287,14 +311,19 @@ reproduction.
 For local integration tests without the real VLA server:
 
 ```bash
-cd openpi-RLT/rlt_online_rl
+cd "$RLT_ROOT/rlt_online_rl"
 python launch/fake_machine_a.py
 ```
 
-Start robot rollout:
+The existing robot rollout below is the legacy 7D Pika/Agilex ROS adapter. It
+must not be used with the 26D GR00T template. GR00T rollout instead requires an
+explicit target-specific `env_factory`; that interface is intentionally left
+unselected until the robot/Teleop action contract is validated.
+
+Legacy robot rollout:
 
 ```bash
-cd openpi-RLT/rlt_online_rl
+cd "$RLT_ROOT/rlt_online_rl"
 source /opt/ros/humble/setup.bash
 conda activate rlt_online_rl310
 python launch/launch_robot_rollout.py \
@@ -316,7 +345,7 @@ only.
 Start an actor service:
 
 ```bash
-cd openpi-RLT/rlt_online_rl
+cd "$RLT_ROOT/rlt_online_rl"
 conda activate rlt_online_rl310
 python scripts/run_online_rl.py \
   --config configs/tasks/agilex_ethernet/online_rl.yaml \
