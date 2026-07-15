@@ -14,7 +14,7 @@ The main pass/fail signal is:
   VL tokens.
 
 If shuffle/image-zero do not hurt reconstruction, the checkpoint may have learned
-teacher-forced reconstruction without using the correct sample's z_rl content.
+reconstruction from learned position queries without using the correct sample's z_rl content.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from groot_rlt.representation.train_vl_embedding_autoencoder import (  # noqa: E
     make_zrl_ablation_variants,
     masked_mse_loss,
     reconstruction_metrics,
+    validate_strict_checkpoint_payload,
 )
 
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "IsaacLab" / "vl_embedding_autoencoder_pi_cached"
@@ -253,6 +254,7 @@ def main() -> None:
 
     tic = time.time()
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    validate_strict_checkpoint_payload(ckpt)
     ckpt_args = dict(ckpt.get("args", {}))
     autoencoder_config = VLTokenAutoencoderConfig(**ckpt["autoencoder_config"])
     autoencoder = VLTokenAutoencoder(autoencoder_config)
@@ -465,7 +467,7 @@ def main() -> None:
         f"device={device} batches={batches} batch_size={batch_size} "
         f"samples={samples} valid_tokens={valid_tokens} autoencoder_bf16={int(autoencoder_bf16)}"
     )
-    print_table("z_rl_ablation_teacher_forcing", ablation, "ratio_vs_normal")
+    print_table("z_rl_ablation_query_reconstruction", ablation, "ratio_vs_normal")
     print("--- encoder_input_sensitivity ---")
     for name, metrics in encoder_input_sensitivity.items():
         print(
@@ -474,7 +476,7 @@ def main() -> None:
             f"l2_to_normal={metrics['l2_to_normal']:.6f}"
         )
     print_table(
-        "damaged_input_z_decode_teacher_forcing",
+        "damaged_input_z_query_reconstruction",
         damaged_input_z_decode,
         "ratio_vs_normal_z",
     )

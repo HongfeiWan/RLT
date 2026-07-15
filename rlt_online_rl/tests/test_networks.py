@@ -15,8 +15,30 @@ from rlt_online_rl.config import RLTOnlineRLConfig
 from rlt_online_rl.networks import ChunkActor
 from rlt_online_rl.networks import TwinCritic
 from rlt_online_rl.networks import apply_reference_dropout
+from rlt_online_rl.networks import build_td_target
 from rlt_online_rl.networks import compute_actor_loss
 from rlt_online_rl.networks import compute_critic_loss
+
+
+class _OnesActor:
+    def sample_action(
+        self,
+        _params,
+        _rng,
+        _z_rl,
+        _proprio,
+        ref_chunk,
+        *,
+        deterministic: bool = False,
+    ):
+        del deterministic
+        return jnp.ones_like(ref_chunk)
+
+
+class _SumTwinCritic:
+    def q_values(self, _params, _z_rl, _proprio, action_chunk):
+        q1 = jnp.sum(action_chunk, axis=(-2, -1))
+        return q1, q1 + 1.0
 
 
 def _config() -> RLTOnlineRLConfig:
@@ -147,3 +169,47 @@ def test_actor_and_critic_losses_are_scalars() -> None:
     )
     assert actor_loss.shape == ()
     assert critic_loss.shape == ()
+
+
+def test_td_target_masks_padding_and_uses_valid_horizon_for_bootstrap() -> None:
+    gamma = 0.9
+    target = build_td_target(
+        _OnesActor(),
+        None,
+        _SumTwinCritic(),
+        None,
+        jnp.zeros((1, 2)),
+        jnp.zeros((1, 2)),
+        jnp.ones((1, 4, 3)),
+        jnp.zeros((1, 4)),
+        jnp.zeros((1,), dtype=jnp.bool_),
+        gamma,
+        jax.random.PRNGKey(9),
+        valid_mask=jnp.asarray([[True, True, False, False]]),
+        next_action_mask=jnp.asarray([[True, False, False, False]]),
+    )
+
+    # Only one 3-D next action row reaches the critic, and the current chunk has
+    # two valid reward steps, so bootstrap discount is gamma**2.
+    assert jnp.allclose(target, jnp.asarray([3.0 * gamma**2]))
+
+
+def test_terminal_td_reward_ignores_padded_values() -> None:
+    gamma = 0.5
+    target = build_td_target(
+        _OnesActor(),
+        None,
+        _SumTwinCritic(),
+        None,
+        jnp.zeros((1, 2)),
+        jnp.zeros((1, 2)),
+        jnp.zeros((1, 4, 3)),
+        jnp.asarray([[1.0, 2.0, 1000.0, 1000.0]]),
+        jnp.ones((1,), dtype=jnp.bool_),
+        gamma,
+        jax.random.PRNGKey(10),
+        valid_mask=jnp.asarray([[True, True, False, False]]),
+        next_action_mask=jnp.zeros((1, 4), dtype=jnp.bool_),
+    )
+
+    assert jnp.allclose(target, jnp.asarray([1.0 + gamma * 2.0]))

@@ -218,9 +218,15 @@ def apply_reference_dropout(
     return ref_chunk * keep_mask.astype(ref_chunk.dtype)
 
 
-def _discounted_chunk_rewards(rewards: jax.Array, gamma: float) -> jax.Array:
+def _discounted_chunk_rewards(
+    rewards: jax.Array,
+    gamma: float,
+    valid_mask: jax.Array | None = None,
+) -> jax.Array:
     discounts = jnp.power(gamma, jnp.arange(rewards.shape[-1], dtype=rewards.dtype))
-    return jnp.sum(rewards * discounts[None, :], axis=-1)
+    if valid_mask is None:
+        valid_mask = jnp.ones_like(rewards, dtype=jnp.bool_)
+    return jnp.sum(rewards * valid_mask.astype(rewards.dtype) * discounts[None, :], axis=-1)
 
 
 def build_td_target(
@@ -235,18 +241,28 @@ def build_td_target(
     done: jax.Array,
     gamma: float,
     rng: jax.Array,
+    *,
+    valid_mask: jax.Array | None = None,
+    next_action_mask: jax.Array | None = None,
 ) -> jax.Array:
+    if valid_mask is None:
+        valid_mask = jnp.ones_like(rewards, dtype=jnp.bool_)
+    if next_action_mask is None:
+        next_action_mask = jnp.ones_like(rewards, dtype=jnp.bool_)
+    masked_next_ref = next_ref_chunk * next_action_mask[..., None].astype(next_ref_chunk.dtype)
     next_action = target_actor.sample_action(
         target_actor_params,
         rng,
         next_z_rl,
         next_proprio,
-        next_ref_chunk,
+        masked_next_ref,
         deterministic=False,
     )
+    next_action = next_action * next_action_mask[..., None].astype(next_action.dtype)
     next_q1, next_q2 = target_critic.q_values(target_critic_params, next_z_rl, next_proprio, next_action)
-    bootstrap = (1.0 - done.astype(rewards.dtype)) * (gamma ** rewards.shape[-1]) * jnp.minimum(next_q1, next_q2)
-    return _discounted_chunk_rewards(rewards, gamma) + bootstrap
+    valid_steps = jnp.sum(valid_mask.astype(rewards.dtype), axis=-1)
+    bootstrap = (1.0 - done.astype(rewards.dtype)) * (gamma**valid_steps) * jnp.minimum(next_q1, next_q2)
+    return _discounted_chunk_rewards(rewards, gamma, valid_mask) + bootstrap
 
 
 def compute_actor_loss(
@@ -291,8 +307,14 @@ def compute_critic_loss(
     next_ref_chunk: jax.Array,
     gamma: float,
     rng: jax.Array,
+    *,
+    valid_mask: jax.Array | None = None,
+    next_action_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-    q1, q2 = critic.q_values(critic_params, z_rl, proprio, action_chunk)
+    if valid_mask is None:
+        valid_mask = jnp.ones_like(rewards, dtype=jnp.bool_)
+    executed_action = action_chunk * valid_mask[..., None].astype(action_chunk.dtype)
+    q1, q2 = critic.q_values(critic_params, z_rl, proprio, executed_action)
     target_q = build_td_target(
         actor,
         target_actor_params,
@@ -305,6 +327,8 @@ def compute_critic_loss(
         done,
         gamma,
         rng,
+        valid_mask=valid_mask,
+        next_action_mask=next_action_mask,
     )
     critic_loss = jnp.mean(jnp.square(q1 - target_q)) + jnp.mean(jnp.square(q2 - target_q))
     metrics = {

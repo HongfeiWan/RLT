@@ -64,6 +64,7 @@ from groot_rlt.representation.train_vl_embedding_autoencoder import (  # noqa: E
     move_backbone_inputs,
     pack_vl_tokens,
     resolve_path,
+    validate_strict_checkpoint_payload,
 )
 
 DEFAULT_CHECKPOINT_DIR = REPO_ROOT / "outputs" / "IsaacLab" / "vl_embedding_autoencoder_pi_cached"
@@ -94,6 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embodiment-tag", type=str, default=EmbodimentTag.NEW_EMBODIMENT.value)
     parser.add_argument("--modality-config-path", type=str, default=str(L10_MODALITY_CONFIG_PATH))
     parser.add_argument("--base-model-path", type=str, default=str(L10_BASE_MODEL_PATH))
+    parser.add_argument("--processor-path", type=str, default=None)
     parser.add_argument("--vlm-model-path", type=str, default=str(L10_VLM_MODEL_PATH))
     parser.add_argument("--instruction", type=str, default=None)
     parser.add_argument("--video-backend", type=str, default="torchcodec")
@@ -208,6 +210,7 @@ def load_rl_token_encoder(
     device: torch.device,
 ) -> tuple[VLTokenAutoencoder, dict[str, Any], int, float]:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    validate_strict_checkpoint_payload(ckpt)
     ckpt_args = dict(ckpt.get("args", {}))
     config = VLTokenAutoencoderConfig(**ckpt["autoencoder_config"])
     model = VLTokenAutoencoder(config)

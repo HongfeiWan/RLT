@@ -56,6 +56,82 @@ def _ensure_array(value: Any, *, dtype: np.dtype | None = None) -> np.ndarray:
     return array
 
 
+_VALID_TRANSITION_SOURCES = frozenset(int(source) for source in TransitionSource)
+
+
+def _prefix_mask(valid_steps: int, chunk_len: int) -> np.ndarray:
+    if valid_steps < 0 or valid_steps > chunk_len:
+        raise ValueError(f"valid_steps must be in [0, {chunk_len}], got {valid_steps}")
+    mask = np.zeros((chunk_len,), dtype=np.bool_)
+    mask[:valid_steps] = True
+    return mask
+
+
+def _coerce_prefix_mask(name: str, value: Any, *, chunk_len: int) -> np.ndarray:
+    raw = _ensure_array(value)
+    if raw.dtype != np.dtype(np.bool_) and not np.isin(raw, (0, 1)).all():
+        raise ValueError(f"{name} must contain only boolean/0/1 values")
+    mask = raw.astype(np.bool_, copy=False)
+    if mask.shape != (chunk_len,):
+        raise ValueError(f"{name} has shape {mask.shape}, expected ({chunk_len},)")
+    false_positions = np.flatnonzero(~mask)
+    if false_positions.size and bool(mask[int(false_positions[0]) :].any()):
+        raise ValueError(f"{name} must be a contiguous true prefix followed by false padding")
+    return mask
+
+
+def _infer_legacy_valid_mask(data: dict[str, Any], *, chunk_len: int) -> np.ndarray:
+    """Accept clearly full legacy records and reject ambiguous padded tails.
+
+    Legacy journals did not persist a validity mask. A zero-valued suffix may be
+    padding or a legitimate hold action. Silently choosing either interpretation
+    changes the actor target, so ambiguous records fail closed and must be
+    regenerated.
+    """
+
+    action = _ensure_array(data["action_chunk"], dtype=np.float32)
+    reference = _ensure_array(_mapping_reference(data, "ref_chunk", "reference_action_chunk"), dtype=np.float32)
+    rewards = _ensure_array(data["rewards"], dtype=np.float32)
+    row_has_evidence = (
+        np.any(action != 0.0, axis=-1)
+        | np.any(reference != 0.0, axis=-1)
+        | (rewards != 0.0)
+    )
+    if "source_chunk" in data:
+        source_chunk = _ensure_array(data["source_chunk"])
+        row_has_evidence |= source_chunk != int(TransitionSource.BASE)
+    if not bool(row_has_evidence[-1]):
+        raise ValueError(
+            "legacy replay record has an ambiguous zero-valued tail and no valid_mask; "
+            "regenerate the journal with explicit masks"
+        )
+    return np.ones((chunk_len,), dtype=np.bool_)
+
+
+def _infer_legacy_next_reference_valid_mask(
+    data: dict[str, Any],
+    next_ref_chunk: np.ndarray,
+    *,
+    chunk_len: int,
+) -> np.ndarray:
+    if bool(data["done"]):
+        return np.zeros((chunk_len,), dtype=np.bool_)
+    if bool(np.any(next_ref_chunk[-1] != 0.0)):
+        return np.ones((chunk_len,), dtype=np.bool_)
+    raise ValueError(
+        "legacy non-terminal replay record has an ambiguous next-reference tail and no "
+        "next_reference_valid_mask; regenerate the journal with explicit masks"
+    )
+
+
+def _mapping_reference(data: dict[str, Any], key: str, alias: str) -> Any:
+    if key in data:
+        return data[key]
+    if alias in data:
+        return data[alias]
+    raise KeyError(f"replay record is missing both {key!r} and {alias!r}")
+
+
 @dataclasses.dataclass(slots=True)
 class EpisodeStepRecord:
     """A single environment step used to build chunk transitions."""
@@ -74,6 +150,7 @@ class EpisodeStepRecord:
     intervention_flag: bool = False
     episode_id: int = 0
     step_id: int = 0
+    segment_id: str | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> EpisodeStepRecord:
@@ -92,6 +169,7 @@ class EpisodeStepRecord:
             intervention_flag=bool(data.get("intervention_flag", False)),
             episode_id=int(data.get("episode_id", 0)),
             step_id=int(data.get("step_id", 0)),
+            segment_id=None if data.get("segment_id") is None else str(data["segment_id"]),
         )
 
 
@@ -113,20 +191,134 @@ class RLTTransition:
     intervention_flag: bool
     episode_id: int
     step_id: int
+    valid_mask: np.ndarray | None = None
+    reference_valid_mask: np.ndarray | None = None
+    next_reference_valid_mask: np.ndarray | None = None
+    segment_id: str | None = None
+
+    def __post_init__(self) -> None:
+        self.z_rl = _ensure_array(self.z_rl, dtype=np.float32)
+        self.proprio = _ensure_array(self.proprio, dtype=np.float32)
+        self.ref_chunk = _ensure_array(self.ref_chunk, dtype=np.float32)
+        self.action_chunk = _ensure_array(self.action_chunk, dtype=np.float32)
+        self.rewards = _ensure_array(self.rewards, dtype=np.float32)
+        self.next_z_rl = _ensure_array(self.next_z_rl, dtype=np.float32)
+        self.next_proprio = _ensure_array(self.next_proprio, dtype=np.float32)
+        self.next_ref_chunk = _ensure_array(self.next_ref_chunk, dtype=np.float32)
+
+        if self.ref_chunk.ndim != 2:
+            raise ValueError(f"ref_chunk must be rank 2, got shape {self.ref_chunk.shape}")
+        chunk_len, action_dim = self.ref_chunk.shape
+        action_shape = (chunk_len, action_dim)
+        if self.action_chunk.shape != action_shape:
+            raise ValueError(f"action_chunk has shape {self.action_chunk.shape}, expected {action_shape}")
+        if self.next_ref_chunk.shape != action_shape:
+            raise ValueError(f"next_ref_chunk has shape {self.next_ref_chunk.shape}, expected {action_shape}")
+        if self.rewards.shape != (chunk_len,):
+            raise ValueError(f"rewards has shape {self.rewards.shape}, expected ({chunk_len},)")
+
+        self.source = int(self.source)
+        if self.source not in _VALID_TRANSITION_SOURCES:
+            raise ValueError(f"source must be one of {sorted(_VALID_TRANSITION_SOURCES)}, got {self.source}")
+        raw_source_chunk = _ensure_array(self.source_chunk)
+        if raw_source_chunk.shape != (chunk_len,):
+            raise ValueError(f"source_chunk has shape {raw_source_chunk.shape}, expected ({chunk_len},)")
+        if not np.isin(raw_source_chunk, tuple(_VALID_TRANSITION_SOURCES)).all():
+            raise ValueError(f"source_chunk contains values outside {sorted(_VALID_TRANSITION_SOURCES)}")
+        self.source_chunk = raw_source_chunk.astype(np.uint8, copy=False)
+
+        self.valid_mask = _coerce_prefix_mask(
+            "valid_mask",
+            np.ones((chunk_len,), dtype=np.bool_) if self.valid_mask is None else self.valid_mask,
+            chunk_len=chunk_len,
+        )
+        self.reference_valid_mask = _coerce_prefix_mask(
+            "reference_valid_mask",
+            self.valid_mask if self.reference_valid_mask is None else self.reference_valid_mask,
+            chunk_len=chunk_len,
+        )
+        self.next_reference_valid_mask = _coerce_prefix_mask(
+            "next_reference_valid_mask",
+            (
+                np.zeros((chunk_len,), dtype=np.bool_)
+                if self.next_reference_valid_mask is None and bool(self.done)
+                else np.ones((chunk_len,), dtype=np.bool_)
+                if self.next_reference_valid_mask is None
+                else self.next_reference_valid_mask
+            ),
+            chunk_len=chunk_len,
+        )
+        if not bool(self.valid_mask.any()):
+            raise ValueError("valid_mask must contain at least one valid action step")
+        if not np.array_equal(self.reference_valid_mask, self.valid_mask):
+            raise ValueError("reference_valid_mask must equal valid_mask for aligned executed/reference chunks")
+        if bool(self.done) and bool(self.next_reference_valid_mask.any()):
+            raise ValueError("terminal transitions must have an all-false next_reference_valid_mask")
+
+        for name in (
+            "z_rl",
+            "proprio",
+            "ref_chunk",
+            "action_chunk",
+            "rewards",
+            "next_z_rl",
+            "next_proprio",
+            "next_ref_chunk",
+        ):
+            value = np.asarray(getattr(self, name))
+            if not np.isfinite(value).all():
+                raise ValueError(f"{name} contains non-finite values")
+
+        padding = ~self.valid_mask
+        if bool(np.any(self.action_chunk[padding] != 0.0)):
+            raise ValueError("action_chunk must be zero in padded rows")
+        if bool(np.any(self.ref_chunk[padding] != 0.0)):
+            raise ValueError("ref_chunk must be zero in padded rows")
+        if bool(np.any(self.rewards[padding] != 0.0)):
+            raise ValueError("rewards must be zero in padded rows")
+        # Existing online collectors persisted a terminal next reference even
+        # though it is never bootstrapped. Canonicalize masked rows to zero so
+        # those records remain readable without allowing the values into a loss.
+        if bool(np.any(~self.next_reference_valid_mask)):
+            self.next_ref_chunk = self.next_ref_chunk.copy()
+            self.next_ref_chunk[~self.next_reference_valid_mask] = 0.0
+
+        self.done = bool(self.done)
+        self.collection_phase = str(self.collection_phase)
+        self.success = int(self.success)
+        self.intervention_flag = bool(self.intervention_flag)
+        self.episode_id = int(self.episode_id)
+        self.step_id = int(self.step_id)
+        self.segment_id = None if self.segment_id is None else str(self.segment_id)
+
+    @property
+    def reference_action_chunk(self) -> np.ndarray:
+        """Alias matching the LeRobot v3 replay contract name."""
+
+        return self.ref_chunk
+
+    @property
+    def next_reference_action_chunk(self) -> np.ndarray:
+        """Alias matching the LeRobot v3 replay contract name."""
+
+        return self.next_ref_chunk
 
     def to_numpy(self) -> ArrayDict:
         return {
             "z_rl": _ensure_array(self.z_rl, dtype=np.float16),
             "proprio": _ensure_array(self.proprio, dtype=np.float32),
-            "ref_chunk": _ensure_array(self.ref_chunk, dtype=np.float16),
-            "action_chunk": _ensure_array(self.action_chunk, dtype=np.float16),
+            "ref_chunk": _ensure_array(self.ref_chunk, dtype=np.float32),
+            "action_chunk": _ensure_array(self.action_chunk, dtype=np.float32),
             "rewards": _ensure_array(self.rewards, dtype=np.float32),
             "done": _ensure_array(self.done, dtype=np.bool_),
             "next_z_rl": _ensure_array(self.next_z_rl, dtype=np.float16),
             "next_proprio": _ensure_array(self.next_proprio, dtype=np.float32),
-            "next_ref_chunk": _ensure_array(self.next_ref_chunk, dtype=np.float16),
+            "next_ref_chunk": _ensure_array(self.next_ref_chunk, dtype=np.float32),
             "source": _ensure_array(self.source, dtype=np.uint8),
             "source_chunk": _ensure_array(self.source_chunk, dtype=np.uint8),
+            "valid_mask": _ensure_array(self.valid_mask, dtype=np.bool_),
+            "reference_valid_mask": _ensure_array(self.reference_valid_mask, dtype=np.bool_),
+            "next_reference_valid_mask": _ensure_array(self.next_reference_valid_mask, dtype=np.bool_),
             "collection_phase_id": _ensure_array(collection_phase_to_id(self.collection_phase), dtype=np.uint8),
             "success": _ensure_array(self.success, dtype=np.int8),
             "intervention_flag": _ensure_array(self.intervention_flag, dtype=np.bool_),
@@ -138,25 +330,39 @@ class RLTTransition:
         return {
             **self.to_numpy(),
             "collection_phase": self.collection_phase,
+            "segment_id": self.segment_id,
         }
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> RLTTransition:
+        ref_chunk = _ensure_array(_mapping_reference(data, "ref_chunk", "reference_action_chunk"), dtype=np.float32)
+        next_ref_chunk = _ensure_array(
+            _mapping_reference(data, "next_ref_chunk", "next_reference_action_chunk"),
+            dtype=np.float32,
+        )
+        if ref_chunk.ndim != 2:
+            raise ValueError(f"ref_chunk must be rank 2, got shape {ref_chunk.shape}")
+        chunk_len = ref_chunk.shape[0]
+        valid_mask = (
+            _infer_legacy_valid_mask(data, chunk_len=chunk_len)
+            if "valid_mask" not in data
+            else data["valid_mask"]
+        )
         return cls(
-            z_rl=_ensure_array(data["z_rl"]),
-            proprio=_ensure_array(data["proprio"]),
-            ref_chunk=_ensure_array(data["ref_chunk"]),
-            action_chunk=_ensure_array(data["action_chunk"]),
-            rewards=_ensure_array(data["rewards"]),
+            z_rl=_ensure_array(data["z_rl"], dtype=np.float32),
+            proprio=_ensure_array(data["proprio"], dtype=np.float32),
+            ref_chunk=ref_chunk,
+            action_chunk=_ensure_array(data["action_chunk"], dtype=np.float32),
+            rewards=_ensure_array(data["rewards"], dtype=np.float32),
             done=bool(data["done"]),
-            next_z_rl=_ensure_array(data["next_z_rl"]),
-            next_proprio=_ensure_array(data["next_proprio"]),
-            next_ref_chunk=_ensure_array(data["next_ref_chunk"]),
+            next_z_rl=_ensure_array(data["next_z_rl"], dtype=np.float32),
+            next_proprio=_ensure_array(data["next_proprio"], dtype=np.float32),
+            next_ref_chunk=next_ref_chunk,
             source=int(data["source"]),
             source_chunk=_ensure_array(
                 data.get(
                     "source_chunk",
-                    np.full((np.asarray(data["ref_chunk"]).shape[0],), int(data["source"]), dtype=np.uint8),
+                    np.full((chunk_len,), int(data["source"]), dtype=np.uint8),
                 ),
                 dtype=np.uint8,
             ),
@@ -165,6 +371,18 @@ class RLTTransition:
             intervention_flag=bool(data.get("intervention_flag", False)),
             episode_id=int(data.get("episode_id", 0)),
             step_id=int(data.get("step_id", 0)),
+            valid_mask=valid_mask,
+            reference_valid_mask=data.get("reference_valid_mask", valid_mask),
+            next_reference_valid_mask=(
+                data["next_reference_valid_mask"]
+                if "next_reference_valid_mask" in data
+                else _infer_legacy_next_reference_valid_mask(
+                    data,
+                    next_ref_chunk,
+                    chunk_len=chunk_len,
+                )
+            ),
+            segment_id=None if data.get("segment_id") is None else str(data["segment_id"]),
         )
 
 
@@ -193,6 +411,9 @@ class ReplayTensorContract:
             "next_proprio": (self.proprio_dim,),
             "next_ref_chunk": (self.chunk_len, self.action_dim),
             "source_chunk": (self.chunk_len,),
+            "valid_mask": (self.chunk_len,),
+            "reference_valid_mask": (self.chunk_len,),
+            "next_reference_valid_mask": (self.chunk_len,),
         }
         for name, expected_shape in expected_shapes.items():
             value = np.asarray(getattr(transition, name))
@@ -200,6 +421,10 @@ class ReplayTensorContract:
                 raise ValueError(f"{context} {name} has shape {value.shape}, expected {expected_shape}")
             if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
                 raise ValueError(f"{context} {name} contains non-finite values")
+        for name in ("ref_chunk", "action_chunk", "next_ref_chunk"):
+            value = np.asarray(getattr(transition, name))
+            if value.dtype != np.dtype(np.float32):
+                raise ValueError(f"{context} {name} has dtype {value.dtype}, expected float32")
 
 
 @dataclasses.dataclass(slots=True)
@@ -339,6 +564,9 @@ def _build_chunk_transition(
         np.uint8,
     )
     done = bool(any(step.done for step in window) or last.done)
+    valid_mask = _prefix_mask(len(window), chunk_len)
+    next_valid_steps = 0 if done else min(chunk_len, max(len(steps) - (start + chunk_len), 0))
+    next_reference_valid_mask = _prefix_mask(next_valid_steps, chunk_len)
     return RLTTransition(
         z_rl=current.z_rl,
         proprio=current.proprio,
@@ -356,7 +584,37 @@ def _build_chunk_transition(
         intervention_flag=intervention,
         episode_id=current.episode_id,
         step_id=current.step_id,
+        valid_mask=valid_mask,
+        reference_valid_mask=valid_mask,
+        next_reference_valid_mask=next_reference_valid_mask,
+        segment_id=current.segment_id,
     )
+
+
+def _split_contiguous_segments(steps: list[EpisodeStepRecord]) -> list[list[EpisodeStepRecord]]:
+    if not steps:
+        return []
+
+    # Older step logs omitted step_id and decode as an all-zero sequence. In that
+    # one case, continuity must be established by the remaining metadata.
+    step_ids_are_informative = any(step.step_id != 0 for step in steps)
+    segments: list[list[EpisodeStepRecord]] = [[steps[0]]]
+    for previous, current in zip(steps, steps[1:], strict=False):
+        explicit_segment_break = (
+            previous.segment_id is not None
+            or current.segment_id is not None
+        ) and previous.segment_id != current.segment_id
+        discontinuous = (
+            bool(previous.done)
+            or current.episode_id != previous.episode_id
+            or current.collection_phase != previous.collection_phase
+            or explicit_segment_break
+            or (step_ids_are_informative and current.step_id != previous.step_id + 1)
+        )
+        if discontinuous:
+            segments.append([])
+        segments[-1].append(current)
+    return segments
 
 
 def build_chunk_transitions_from_episode(
@@ -380,12 +638,22 @@ def build_chunk_transitions_from_episode(
     if not steps:
         return []
 
-    transitions: list[RLTTransition] = []
+    if chunk_len <= 0:
+        raise ValueError("chunk_len must be positive")
+    if stride <= 0:
+        raise ValueError("stride must be positive")
 
-    for start in range(0, len(steps), stride):
-        if not allow_partial and start + chunk_len > len(steps):
-            break
-        transitions.append(_build_chunk_transition(steps, start=start, chunk_len=chunk_len))
+    transitions: list[RLTTransition] = []
+    for segment in _split_contiguous_segments(steps):
+        for start in range(0, len(segment), stride):
+            is_partial = start + chunk_len > len(segment)
+            if start + chunk_len >= len(segment) and not segment[-1].done:
+                # A truncated non-terminal segment has no safe bootstrap
+                # reference. It must not borrow one across a gap or boundary.
+                break
+            if is_partial and (not allow_partial or not segment[-1].done):
+                break
+            transitions.append(_build_chunk_transition(segment, start=start, chunk_len=chunk_len))
 
     return transitions
 
@@ -398,10 +666,16 @@ def build_terminal_aligned_chunk_transition(
     steps = [
         step if isinstance(step, EpisodeStepRecord) else EpisodeStepRecord.from_mapping(step) for step in episode_steps
     ]
-    if len(steps) < chunk_len or not steps[-1].done:
+    if chunk_len <= 0:
+        raise ValueError("chunk_len must be positive")
+    segments = _split_contiguous_segments(steps)
+    if not segments:
         return None
-    start = len(steps) - chunk_len
-    return _build_chunk_transition(steps, start=start, chunk_len=chunk_len)
+    terminal_segment = segments[-1]
+    if len(terminal_segment) < chunk_len or not terminal_segment[-1].done:
+        return None
+    start = len(terminal_segment) - chunk_len
+    return _build_chunk_transition(terminal_segment, start=start, chunk_len=chunk_len)
 
 
 class ReplayBuffer:

@@ -131,6 +131,33 @@ def _resolve_actor_loss_weights(
     return float(rl_config.online_bc_weight), float(rl_config.online_q_weight)
 
 
+def build_actor_supervision_targets(
+    action_chunk: jax.Array,
+    reference_action_chunk: jax.Array,
+    source_chunk: jax.Array,
+    valid_mask: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Resolve the per-step actor target without changing action coordinates.
+
+    HUMAN and MIXED rows imitate the action that was actually executed. BASE and
+    RL rows use the frozen-policy reference as a regularizer. Padding is excluded
+    from both objectives and is zeroed before it can reach either network.
+    """
+
+    valid_mask = valid_mask.astype(jnp.bool_)
+    human_mask = jnp.logical_and(
+        valid_mask,
+        jnp.logical_or(
+            source_chunk == int(TransitionSource.HUMAN),
+            source_chunk == int(TransitionSource.MIXED),
+        ),
+    )
+    policy_mask = jnp.logical_and(valid_mask, jnp.logical_not(human_mask))
+    target = jnp.where(human_mask[..., None], action_chunk, reference_action_chunk)
+    target = target * valid_mask[..., None].astype(target.dtype)
+    return target, valid_mask, policy_mask, human_mask
+
+
 def update_critic(
     state: RLTTrainState,
     batch: dict[str, jax.Array],
@@ -157,6 +184,8 @@ def update_critic(
             batch["next_ref_chunk"],
             rl_config.gamma,
             critic_rng,
+            valid_mask=batch.get("valid_mask"),
+            next_action_mask=batch.get("next_reference_valid_mask"),
         )
 
     (critic_loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.critic_params)
@@ -197,7 +226,7 @@ def update_actor(
             batch["ref_chunk"],
             rl_config.reference_dropout_prob,
         )
-        action_chunk = actor.sample_action(
+        sampled_action_chunk = actor.sample_action(
             actor_params,
             sample_rng,
             batch["z_rl"],
@@ -205,27 +234,32 @@ def update_actor(
             dropped_ref,
             deterministic=False,
         )
+        valid_mask = batch.get("valid_mask", jnp.ones(batch["rewards"].shape, dtype=jnp.bool_))
+        bc_target, valid_mask, policy_mask, human_mask = build_actor_supervision_targets(
+            batch["action_chunk"],
+            batch["ref_chunk"],
+            batch["source_chunk"],
+            valid_mask,
+        )
+        action_chunk = sampled_action_chunk * valid_mask[..., None].astype(sampled_action_chunk.dtype)
         q1, _ = critic.q_values(
             state.critic_params,
             batch["z_rl"],
             batch["proprio"],
             action_chunk,
         )
-        source_chunk = batch["source_chunk"]
-        human_mask = jnp.logical_or(
-            source_chunk == int(TransitionSource.HUMAN),
-            source_chunk == int(TransitionSource.MIXED),
-        )
         human_mask_f = human_mask.astype(jnp.float32)
-        policy_mask_f = 1.0 - human_mask_f
-        bc_target = jnp.where(human_mask[..., None], batch["action_chunk"], batch["ref_chunk"])
+        policy_mask_f = policy_mask.astype(jnp.float32)
+        valid_mask_f = valid_mask.astype(jnp.float32)
         bc_error = jnp.mean(jnp.square(action_chunk - bc_target), axis=-1)
         ref_error = jnp.mean(jnp.square(action_chunk - batch["ref_chunk"]), axis=-1)
         human_error = jnp.mean(jnp.square(action_chunk - batch["action_chunk"]), axis=-1)
-        bc_penalty = jnp.mean(bc_error)
+        valid_count = jnp.maximum(jnp.sum(valid_mask_f), 1.0)
+        bc_penalty = jnp.sum(bc_error * valid_mask_f) / valid_count
         bc_ref_penalty = jnp.sum(ref_error * policy_mask_f) / jnp.maximum(jnp.sum(policy_mask_f), 1.0)
         bc_human_penalty = jnp.sum(human_error * human_mask_f) / jnp.maximum(jnp.sum(human_mask_f), 1.0)
-        human_mask_ratio = jnp.mean(human_mask_f)
+        human_mask_ratio = jnp.sum(human_mask_f) / valid_count
+        policy_mask_ratio = jnp.sum(policy_mask_f) / valid_count
         if not use_action_adapter:
             pred_abs_chunk = action_chunk
             target_abs_chunk = bc_target
@@ -257,7 +291,9 @@ def update_actor(
             target_selected = target_abs_chunk[..., delta_index_array]
             pred_step_delta = pred_selected[:, 1:] - pred_selected[:, :-1]
             target_step_delta = target_selected[:, 1:] - target_selected[:, :-1]
-            delta_penalty = jnp.mean(jnp.square(pred_step_delta - target_step_delta))
+            pair_mask = jnp.logical_and(valid_mask[:, 1:], valid_mask[:, :-1]).astype(jnp.float32)
+            delta_error = jnp.mean(jnp.square(pred_step_delta - target_step_delta), axis=-1)
+            delta_penalty = jnp.sum(delta_error * pair_mask) / jnp.maximum(jnp.sum(pair_mask), 1.0)
         else:
             delta_penalty = jnp.asarray(0.0, dtype=jnp.float32)
         actor_q = jnp.mean(q1)
@@ -272,7 +308,8 @@ def update_actor(
             "bc_ref_penalty": bc_ref_penalty,
             "bc_human_penalty": bc_human_penalty,
             "human_mask_ratio": human_mask_ratio,
-            "policy_mask_ratio": 1.0 - human_mask_ratio,
+            "policy_mask_ratio": policy_mask_ratio,
+            "valid_step_ratio": jnp.mean(valid_mask_f),
             "delta_penalty": delta_penalty,
             "weighted_bc": weighted_bc,
             "weighted_delta": weighted_delta,
@@ -321,6 +358,7 @@ def train_step(
         "bc_human_penalty": jnp.array(0.0, dtype=jnp.float32),
         "human_mask_ratio": jnp.array(0.0, dtype=jnp.float32),
         "policy_mask_ratio": jnp.array(0.0, dtype=jnp.float32),
+        "valid_step_ratio": jnp.array(0.0, dtype=jnp.float32),
         "delta_penalty": jnp.array(0.0, dtype=jnp.float32),
         "weighted_bc": jnp.array(0.0, dtype=jnp.float32),
         "weighted_delta": jnp.array(0.0, dtype=jnp.float32),
@@ -389,6 +427,130 @@ def _ensure_source_chunk(batch_np: dict[str, np.ndarray], chunk_len: int) -> dic
     source = np.asarray(batch_np["source"], dtype=np.uint8).reshape(-1, 1)
     batch_np["source_chunk"] = np.repeat(source, int(chunk_len), axis=1)
     return batch_np
+
+
+def _coerce_batch_prefix_mask(name: str, value: Any, *, batch_size: int, chunk_len: int) -> np.ndarray:
+    raw = np.asarray(value)
+    if raw.shape != (batch_size, chunk_len):
+        raise ValueError(f"replay batch {name} has shape {raw.shape}, expected {(batch_size, chunk_len)}")
+    if raw.dtype != np.dtype(np.bool_) and not np.isin(raw, (0, 1)).all():
+        raise ValueError(f"replay batch {name} must contain only boolean/0/1 values")
+    mask = raw.astype(np.bool_, copy=False)
+    if chunk_len > 1 and np.any(np.diff(mask.astype(np.int8), axis=1) > 0):
+        raise ValueError(f"replay batch {name} must be a contiguous true prefix")
+    return mask
+
+
+def prepare_replay_training_batch(
+    batch_np: dict[str, np.ndarray],
+    rl_config: RLTOnlineRLConfig,
+) -> dict[str, np.ndarray]:
+    """Validate and canonicalize replay tensors before device transfer."""
+
+    prepared = _ensure_source_chunk(dict(batch_np), rl_config.chunk_len)
+    z_rl = np.asarray(prepared["z_rl"])
+    if z_rl.ndim != 2:
+        raise ValueError(f"replay batch z_rl must be rank 2, got shape {z_rl.shape}")
+    batch_size = z_rl.shape[0]
+    if batch_size == 0:
+        raise ValueError("replay batch must contain at least one transition")
+    expected_shapes = {
+        "z_rl": (batch_size, rl_config.z_dim),
+        "proprio": (batch_size, rl_config.proprio_dim),
+        "ref_chunk": (batch_size, rl_config.chunk_len, rl_config.action_dim),
+        "action_chunk": (batch_size, rl_config.chunk_len, rl_config.action_dim),
+        "rewards": (batch_size, rl_config.chunk_len),
+        "done": (batch_size,),
+        "next_z_rl": (batch_size, rl_config.z_dim),
+        "next_proprio": (batch_size, rl_config.proprio_dim),
+        "next_ref_chunk": (batch_size, rl_config.chunk_len, rl_config.action_dim),
+        "source": (batch_size,),
+        "source_chunk": (batch_size, rl_config.chunk_len),
+    }
+    for name, expected_shape in expected_shapes.items():
+        value = np.asarray(prepared[name])
+        if value.shape != expected_shape:
+            raise ValueError(f"replay batch {name} has shape {value.shape}, expected {expected_shape}")
+
+    for name in (
+        "z_rl",
+        "proprio",
+        "ref_chunk",
+        "action_chunk",
+        "rewards",
+        "next_z_rl",
+        "next_proprio",
+        "next_ref_chunk",
+    ):
+        value = np.asarray(prepared[name], dtype=np.float32)
+        if not np.isfinite(value).all():
+            raise ValueError(f"replay batch {name} contains non-finite values")
+        prepared[name] = value
+
+    raw_done = np.asarray(prepared["done"])
+    if raw_done.dtype != np.dtype(np.bool_) and not np.isin(raw_done, (0, 1)).all():
+        raise ValueError("replay batch done must contain only boolean/0/1 values")
+    done = raw_done.astype(np.bool_, copy=False)
+    source = np.asarray(prepared["source"])
+    source_chunk = np.asarray(prepared["source_chunk"])
+    valid_sources = tuple(int(item) for item in TransitionSource)
+    if not np.isin(source, valid_sources).all():
+        raise ValueError(f"replay batch source contains values outside {valid_sources}")
+    if not np.isin(source_chunk, valid_sources).all():
+        raise ValueError(f"replay batch source_chunk contains values outside {valid_sources}")
+    prepared["done"] = done
+    prepared["source"] = source.astype(np.uint8, copy=False)
+    prepared["source_chunk"] = source_chunk.astype(np.uint8, copy=False)
+
+    if "valid_mask" not in prepared:
+        if bool(done.any()):
+            raise ValueError(
+                "legacy terminal replay batch has no valid_mask; reload it through ReplayManager "
+                "or regenerate the journal"
+            )
+        prepared["valid_mask"] = np.ones((batch_size, rl_config.chunk_len), dtype=np.bool_)
+    valid_mask = _coerce_batch_prefix_mask(
+        "valid_mask",
+        prepared["valid_mask"],
+        batch_size=batch_size,
+        chunk_len=rl_config.chunk_len,
+    )
+    if np.any(~np.any(valid_mask, axis=1)):
+        raise ValueError("replay batch valid_mask must contain at least one valid step per transition")
+    reference_valid_mask = _coerce_batch_prefix_mask(
+        "reference_valid_mask",
+        prepared.get("reference_valid_mask", valid_mask),
+        batch_size=batch_size,
+        chunk_len=rl_config.chunk_len,
+    )
+    if not np.array_equal(valid_mask, reference_valid_mask):
+        raise ValueError("replay batch reference_valid_mask must equal valid_mask")
+    next_reference_valid_mask = _coerce_batch_prefix_mask(
+        "next_reference_valid_mask",
+        prepared.get(
+            "next_reference_valid_mask",
+            np.repeat((~done)[:, None], rl_config.chunk_len, axis=1),
+        ),
+        batch_size=batch_size,
+        chunk_len=rl_config.chunk_len,
+    )
+    if np.any(next_reference_valid_mask[done]):
+        raise ValueError("terminal replay transitions must not contain valid next-reference steps")
+    if np.any(~done & ~np.any(next_reference_valid_mask, axis=1)):
+        raise ValueError("non-terminal replay transitions must contain a valid next-reference prefix")
+
+    padding = ~valid_mask
+    for name in ("ref_chunk", "action_chunk"):
+        if np.any(prepared[name][padding] != 0.0):
+            raise ValueError(f"replay batch {name} must be zero in padded rows")
+    if np.any(prepared["rewards"][padding] != 0.0):
+        raise ValueError("replay batch rewards must be zero in padded rows")
+    prepared["next_ref_chunk"] = prepared["next_ref_chunk"].copy()
+    prepared["next_ref_chunk"][~next_reference_valid_mask] = 0.0
+    prepared["valid_mask"] = valid_mask
+    prepared["reference_valid_mask"] = reference_valid_mask
+    prepared["next_reference_valid_mask"] = next_reference_valid_mask
+    return prepared
 
 
 def _sample_composition_metrics(
@@ -528,9 +690,9 @@ class LearnerService:
         if stop_event is not None and stop_event.is_set():
             return None
 
-        batch_np = _ensure_source_chunk(
+        batch_np = prepare_replay_training_batch(
             self._replay_source.sample_batch(self._service_config.sample_batch_size),
-            self._rl_config.chunk_len,
+            self._rl_config,
         )
         max_episode_id = int(stats.get("max_episode_id", -1))
         recent_window = int(stats.get("recent_episode_window", 20))

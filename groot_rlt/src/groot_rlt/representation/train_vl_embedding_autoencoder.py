@@ -18,8 +18,10 @@ router, and reference-action dropout are intentionally left outside this script.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
+import math
 import os
 import random
 import re
@@ -34,10 +36,15 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, IterableDataset
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModel, AutoProcessor
 from transformers.feature_extraction_utils import BatchFeature
 
 from groot_rlt.groot_repo import ensure_groot_repo
+from groot_rlt.integration.artifact_lineage import (
+    canonical_json_sha256,
+    checkpoint_fingerprint,
+    file_sha256,
+)
 from groot_rlt.paths import VL_EMBEDDING_CACHE_DIR
 
 REPO_ROOT = ensure_groot_repo()
@@ -46,8 +53,9 @@ os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS  # noqa: E402
 from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader  # noqa: E402
 from gr00t.data.embodiment_tags import EmbodimentTag  # noqa: E402
-from gr00t.model.gr00t_n1d7.gr00t_n1d7 import get_backbone_cls  # noqa: E402
 from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor  # noqa: E402
+
+from groot_rlt.integration.checkpoint_policy_utils import resolve_processor_path  # noqa: E402
 
 try:  # noqa: E402
     from groot_rlt.integration.defaults import (
@@ -68,6 +76,12 @@ except Exception:  # pragma: no cover - keeps the script usable outside IsaacLab
 TokenScope = Literal["all", "image", "non_image"]
 TokenSampling = Literal["head", "tail", "uniform", "random"]
 
+RL_TOKEN_ARCHITECTURE = "openpi_rlt_strict_cross_attention_v1"
+RL_TOKEN_CHECKPOINT_SCHEMA_VERSION = 2
+VL_CACHE_SCHEMA_VERSION = 2
+VL_CACHE_FEATURE_TAP = "raw_backbone_pre_action_head"
+VL_CACHE_PROCESSOR_MODE = "eval"
+
 
 @dataclass
 class VLTokenAutoencoderConfig:
@@ -79,33 +93,24 @@ class VLTokenAutoencoderConfig:
     decoder_layers: int = 2
     num_heads: int = 8
     mlp_ratio: float = 4.0
-    dropout: float = 0.1
+    dropout: float = 0.0
     use_prefix_mask_token: bool = False
-    use_decoder_cross_attention: bool = False
+    use_decoder_cross_attention: bool = True
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1.0e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return output * self.weight
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int, dropout: float):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.gate_proj(x)) * self.up_proj(x)
-        return self.down_proj(self.dropout(x))
+def sinusoidal_position_embeddings(seq_len: int, dim: int) -> torch.Tensor:
+    """Match openpi's trainable sinusoidal parameter initialization."""
+    if dim % 2 != 0:
+        raise ValueError(f"Position embedding dimension must be even, got {dim}")
+    position = torch.arange(seq_len, dtype=torch.float32)
+    div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * -(math.log(10000.0) / dim))
+    return torch.cat(
+        [
+            torch.sin(position[:, None] * div_term),
+            torch.cos(position[:, None] * div_term),
+        ],
+        dim=-1,
+    )
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -116,10 +121,10 @@ class MultiHeadSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.o_proj = nn.Linear(dim, dim)
         self.dropout_p = dropout
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
@@ -176,10 +181,10 @@ class MultiHeadCrossAttention(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.o_proj = nn.Linear(dim, dim)
         self.dropout_p = dropout
 
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
@@ -221,127 +226,110 @@ class MultiHeadCrossAttention(nn.Module):
         return self.o_proj(output)
 
 
-class TransformerBlock(nn.Module):
-    """RMSNorm + self-attention + RMSNorm + SwiGLU FFN block."""
+class OpenPiGeGLUMLP(nn.Module):
+    """PyTorch equivalent of openpi's Dense, Dropout, GeGLU, Dense MLP."""
 
-    def __init__(self, dim: int, num_heads: int, ffn_dim: int, dropout: float):
+    def __init__(self, dim: int, mlp_ratio: float, dropout: float):
         super().__init__()
-        self.attn_norm = RMSNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim, num_heads, dropout)
-        self.ffn_norm = RMSNorm(dim)
-        self.ffn = SwiGLU(dim, ffn_dim, dropout)
+        hidden_dim = int(dim * mlp_ratio)
+        self.input_proj = nn.Linear(dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.geglu_proj = nn.Linear(hidden_dim, hidden_dim * 2)
+        self.output_proj = nn.Linear(hidden_dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(self.input_proj(x))
+        value, gate = self.geglu_proj(x).chunk(2, dim=-1)
+        return self.output_proj(value * F.gelu(gate, approximate="tanh"))
+
+
+class OpenPiCrossAttentionBlock(nn.Module):
+    """Exact block order used by openpi-RLT's CrossAttentionLayer."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float):
+        super().__init__()
+        self.self_attn_norm = nn.LayerNorm(dim, eps=1.0e-6)
+        self.self_attn = MultiHeadSelfAttention(dim, num_heads, dropout)
+        self.cross_attn_norm = nn.LayerNorm(dim, eps=1.0e-6)
+        self.cross_attn = MultiHeadCrossAttention(dim, num_heads, dropout)
+        self.mlp_norm = nn.LayerNorm(dim, eps=1.0e-6)
+        self.mlp = OpenPiGeGLUMLP(dim, mlp_ratio, dropout)
 
     def forward(
         self,
         x: torch.Tensor,
+        memory: torch.Tensor,
         *,
-        key_padding_mask: torch.Tensor | None = None,
-        causal: bool = False,
-    ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), key_padding_mask=key_padding_mask, causal=causal)
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-class DecoderTransformerBlock(nn.Module):
-    """Causal decoder block with optional cross-attention to the RL token memory."""
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        ffn_dim: int,
-        dropout: float,
-        *,
-        use_cross_attention: bool,
-    ):
-        super().__init__()
-        self.use_cross_attention = bool(use_cross_attention)
-        self.attn_norm = RMSNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim, num_heads, dropout)
-        if self.use_cross_attention:
-            self.cross_attn_norm = RMSNorm(dim)
-            self.cross_attn = MultiHeadCrossAttention(dim, num_heads, dropout)
-        else:
-            self.cross_attn_norm = None
-            self.cross_attn = None
-        self.ffn_norm = RMSNorm(dim)
-        self.ffn = SwiGLU(dim, ffn_dim, dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        key_padding_mask: torch.Tensor | None = None,
-        causal: bool = False,
-        memory: torch.Tensor | None = None,
         memory_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), key_padding_mask=key_padding_mask, causal=causal)
-        if self.use_cross_attention:
-            if memory is None:
-                raise ValueError("Decoder cross-attention requires memory.")
-            assert self.cross_attn is not None
-            assert self.cross_attn_norm is not None
-            x = x + self.cross_attn(
-                self.cross_attn_norm(x),
-                memory,
-                memory_key_padding_mask=memory_key_padding_mask,
-            )
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
+        x = x + self.self_attn(self.self_attn_norm(x))
+        x = x + self.cross_attn(
+            self.cross_attn_norm(x),
+            memory,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )
+        return x + self.mlp(self.mlp_norm(x))
 
 
 class VLTokenAutoencoder(nn.Module):
-    """Query encoder plus autoregressive decoder for frozen VLA VL embeddings."""
+    """Strict PyTorch reproduction of openpi-RLT's RLTokenModel."""
 
     def __init__(self, config: VLTokenAutoencoderConfig):
         super().__init__()
         self.config = config
-        if config.input_dim != config.model_dim:
-            raise ValueError(
-                "The pi-style VL autoencoder keeps the VLA embedding dimension unchanged; "
-                f"got input_dim={config.input_dim}, model_dim={config.model_dim}."
-            )
         if config.rl_token_dim != config.model_dim:
             raise ValueError(
-                "The pi-style RL token is the query output itself and must match model_dim; "
+                "The openpi-style RL token is the query output and must match model_dim; "
                 f"got rl_token_dim={config.rl_token_dim}, model_dim={config.model_dim}."
             )
+        if not config.use_decoder_cross_attention:
+            raise ValueError("Strict openpi-RLT reproduction requires decoder cross-attention.")
 
-        self.query_token = nn.Parameter(torch.empty(1, 1, config.model_dim))
-        ff_dim = int(config.model_dim * config.mlp_ratio)
+        self.input_proj = (
+            nn.Linear(config.input_dim, config.model_dim)
+            if config.input_dim != config.model_dim
+            else nn.Identity()
+        )
+        self.query_token = nn.Parameter(sinusoidal_position_embeddings(1, config.model_dim))
+        self.encoder_memory_pos = nn.Parameter(
+            sinusoidal_position_embeddings(config.max_vl_tokens, config.model_dim)
+        )
+        self.decoder_query = nn.Parameter(
+            sinusoidal_position_embeddings(config.max_vl_tokens, config.model_dim)
+        )
+        self.decoder_memory_pos = nn.Parameter(sinusoidal_position_embeddings(1, config.model_dim))
         self.encoder = nn.ModuleList(
             [
-                TransformerBlock(config.model_dim, config.num_heads, ff_dim, config.dropout)
+                OpenPiCrossAttentionBlock(
+                    config.model_dim,
+                    config.num_heads,
+                    config.mlp_ratio,
+                    config.dropout,
+                )
                 for _ in range(config.encoder_layers)
             ]
         )
         self.decoder = nn.ModuleList(
             [
-                DecoderTransformerBlock(
+                OpenPiCrossAttentionBlock(
                     config.model_dim,
                     config.num_heads,
-                    ff_dim,
+                    config.mlp_ratio,
                     config.dropout,
-                    use_cross_attention=config.use_decoder_cross_attention,
                 )
                 for _ in range(config.decoder_layers)
             ]
         )
-        self.encoder_norm = RMSNorm(config.model_dim)
-        self.decoder_norm = RMSNorm(config.model_dim)
-        self.output_proj = nn.Linear(config.model_dim, config.input_dim, bias=False)
+        self.output_proj = (
+            nn.Linear(config.model_dim, config.input_dim)
+            if config.input_dim != config.model_dim
+            else nn.Identity()
+        )
         if config.use_prefix_mask_token:
             self.prefix_mask_token = nn.Parameter(torch.empty(1, 1, config.model_dim))
+            nn.init.normal_(self.prefix_mask_token, std=0.02)
         else:
             self.register_parameter("prefix_mask_token", None)
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.normal_(self.query_token, std=0.02)
-        if self.prefix_mask_token is not None:
-            nn.init.normal_(self.prefix_mask_token, std=0.02)
 
     def encode_rl_token(self, vl_embeddings: torch.Tensor, vl_mask: torch.Tensor) -> torch.Tensor:
         """Return the compact token intended for future RL actor/critic conditioning.
@@ -353,21 +341,33 @@ class VLTokenAutoencoder(nn.Module):
         Returns:
             Tensor of shape ``[B, 2048]``.
         """
+        if vl_embeddings.ndim != 3:
+            raise ValueError(
+                f"Expected vl_embeddings shape [B, S, D], got {tuple(vl_embeddings.shape)}"
+            )
         batch_size, seq_len, _ = vl_embeddings.shape
+        if tuple(vl_mask.shape) != (batch_size, seq_len):
+            raise ValueError(
+                f"Expected vl_mask shape {(batch_size, seq_len)}, got {tuple(vl_mask.shape)}"
+            )
+        empty_samples = torch.nonzero(~vl_mask.bool().any(dim=1), as_tuple=False).flatten()
+        if empty_samples.numel():
+            raise ValueError(
+                "Every RL-token sample must contain at least one valid prefix token; "
+                f"empty batch indices={empty_samples.tolist()}"
+            )
         if seq_len > self.config.max_vl_tokens:
             raise ValueError(
                 f"Expected at most {self.config.max_vl_tokens} tokens, got {seq_len}. "
                 "Pack or subsample the VL sequence before calling encode_rl_token()."
             )
 
-        query = self.query_token.expand(batch_size, -1, -1)
-        x = torch.cat([vl_embeddings, query], dim=1)
-        query_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=vl_mask.device)
-        key_padding_mask = ~torch.cat([vl_mask, query_mask], dim=1)
+        x = self.query_token.expand(batch_size, -1, -1)
+        memory = self.input_proj(vl_embeddings)
+        memory = memory + self.encoder_memory_pos[:seq_len].unsqueeze(0)
         for block in self.encoder:
-            x = block(x, key_padding_mask=key_padding_mask, causal=False)
-        x = self.encoder_norm(x)
-        return x[:, -1]
+            x = block(x, memory, memory_key_padding_mask=~vl_mask)
+        return x[:, 0]
 
     def decode_from_rl_token(
         self,
@@ -376,44 +376,23 @@ class VLTokenAutoencoder(nn.Module):
         target_mask: torch.Tensor,
         decoder_prefix_embeddings: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Teacher-forced autoregressive reconstruction from an RL token."""
+        """Reconstruct solely from learned positional queries and the RL token."""
         batch_size, seq_len, _ = target_embeddings.shape
         if seq_len > self.config.max_vl_tokens:
             raise ValueError(f"Expected at most {self.config.max_vl_tokens} tokens, got {seq_len}.")
-
-        if seq_len == 1:
-            x = rl_token[:, None, :]
-        else:
-            decoder_prefix = (
-                target_embeddings[:, :-1]
-                if decoder_prefix_embeddings is None
-                else decoder_prefix_embeddings
+        if tuple(target_mask.shape) != (batch_size, seq_len):
+            raise ValueError(
+                f"Expected target_mask shape {(batch_size, seq_len)}, got {tuple(target_mask.shape)}."
             )
-            expected_prefix_shape = (batch_size, seq_len - 1, target_embeddings.shape[-1])
-            if tuple(decoder_prefix.shape) != expected_prefix_shape:
-                raise ValueError(
-                    f"Expected decoder_prefix_embeddings shape {expected_prefix_shape}, "
-                    f"got {tuple(decoder_prefix.shape)}."
-                )
-            x = torch.cat([rl_token[:, None, :], decoder_prefix], dim=1)
+        if decoder_prefix_embeddings is not None:
+            raise ValueError(
+                "Strict openpi-RLT decoder does not accept ground-truth prefix embeddings."
+            )
 
-        start_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=target_mask.device)
-        key_padding_mask = ~torch.cat([start_mask, target_mask[:, :-1]], dim=1)
-        memory = rl_token[:, None, :] if self.config.use_decoder_cross_attention else None
-        memory_key_padding_mask = (
-            torch.zeros(batch_size, 1, dtype=torch.bool, device=target_mask.device)
-            if self.config.use_decoder_cross_attention
-            else None
-        )
+        x = self.decoder_query[:seq_len].unsqueeze(0).expand(batch_size, -1, -1)
+        memory = rl_token[:, None, :] + self.decoder_memory_pos.unsqueeze(0)
         for block in self.decoder:
-            x = block(
-                x,
-                key_padding_mask=key_padding_mask,
-                causal=True,
-                memory=memory,
-                memory_key_padding_mask=memory_key_padding_mask,
-            )
-        x = self.decoder_norm(x)
+            x = block(x, memory)
         return self.output_proj(x)
 
     def forward(
@@ -453,6 +432,71 @@ def load_autoencoder_state_dict(
         print(f"Initialized new autoencoder parameter(s): {sorted(missing)}")
     if unexpected:
         print(f"Ignored unused autoencoder checkpoint parameter(s): {sorted(unexpected)}")
+
+
+_STRICT_STATE_SENTINELS = {
+    "query_token",
+    "encoder_memory_pos",
+    "decoder_query",
+    "decoder_memory_pos",
+}
+
+
+def validate_strict_checkpoint_payload(checkpoint: dict[str, Any]) -> None:
+    """Reject checkpoints that do not implement the strict cross-attention model."""
+
+    architecture = checkpoint.get("architecture")
+    schema_version = checkpoint.get("schema_version")
+    state = checkpoint.get("autoencoder")
+    if not isinstance(state, dict):
+        raise ValueError("RL-token checkpoint does not contain an autoencoder state dict")
+    missing_sentinels = sorted(_STRICT_STATE_SENTINELS - set(state))
+    if missing_sentinels:
+        raise ValueError(
+            "RL-token checkpoint is not the strict cross-attention architecture; "
+            f"missing sentinel keys={missing_sentinels}"
+        )
+    if architecture is None and schema_version is None:
+        # One-time compatibility for the immutable 2026-07-14 10k archive.
+        return
+    if architecture != RL_TOKEN_ARCHITECTURE:
+        raise ValueError(
+            f"RL-token checkpoint architecture={architecture!r}, expected {RL_TOKEN_ARCHITECTURE!r}"
+        )
+    if int(schema_version) != RL_TOKEN_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(
+            f"RL-token checkpoint schema_version={schema_version!r}, expected "
+            f"{RL_TOKEN_CHECKPOINT_SCHEMA_VERSION}"
+        )
+
+
+def validate_cached_embedding_contract(
+    manifest: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    """Require a direct checkpoint-prefix cache with no secondary token selection."""
+
+    expected = {
+        "schema_version": VL_CACHE_SCHEMA_VERSION,
+        "representation_source": "groot_checkpoint_backbone",
+        "feature_tap": VL_CACHE_FEATURE_TAP,
+        "processor_mode": VL_CACHE_PROCESSOR_MODE,
+        "token_scope": args.token_scope,
+        "token_sampling": args.token_sampling,
+        "max_vl_tokens": int(args.max_vl_tokens),
+        "episode_sampling_rate": float(args.episode_sampling_rate),
+        "dataset_sampling_seed": int(args.seed),
+    }
+    mismatches = [
+        f"{name}: cache={manifest.get(name)!r} expected={value!r}"
+        for name, value in expected.items()
+        if manifest.get(name) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "Embedding cache is not a direct serving-equivalent prefix cache: "
+            + "; ".join(mismatches)
+        )
 
 
 def load_modality_config(path: str | Path | None) -> None:
@@ -534,6 +578,10 @@ class VLOnlyLeRobotDataset(IterableDataset):
         rng = np.random.default_rng(self.seed + self.epoch)
         episode_indices = np.arange(len(self.loader))
         rng.shuffle(episode_indices)
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # IterableDataset copies must own disjoint episodes across workers.
+            episode_indices = episode_indices[worker_info.id :: worker_info.num_workers]
         for episode_index in episode_indices:
             episode = self.loader[int(episode_index)]
             step_indices = self._sample_step_indices(len(episode), rng)
@@ -551,7 +599,7 @@ class VLOnlyLeRobotDataset(IterableDataset):
                     image_keys=image_keys,
                     images=images,
                     masks=None,
-                    image_transform=self.processor.train_image_transform,
+                    image_transform=self.processor.eval_image_transform,
                     language=language,
                 )
 
@@ -624,6 +672,15 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embodiment-tag", type=str, default=EmbodimentTag.NEW_EMBODIMENT.value)
     parser.add_argument("--modality-config-path", type=str, default=str(L10_MODALITY_CONFIG_PATH))
     parser.add_argument("--base-model-path", type=str, default=str(L10_BASE_MODEL_PATH))
+    parser.add_argument(
+        "--processor-path",
+        type=str,
+        default=None,
+        help=(
+            "Checkpoint processor directory. Defaults to the processor saved with "
+            "--base-model-path."
+        ),
+    )
     parser.add_argument("--vlm-model-path", type=str, default=str(L10_VLM_MODEL_PATH))
     parser.add_argument(
         "--instruction",
@@ -646,9 +703,31 @@ def make_arg_parser() -> argparse.ArgumentParser:
         help="DataLoader worker processes. Use -1 for every CPU visible to the process.",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--min-learning-rate", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=None,
+        help="Step at which cosine decay reaches --min-learning-rate. Defaults to --max-steps.",
+    )
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.999)
+    parser.add_argument("--adam-eps", type=float, default=1e-8)
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=None,
+        help="Optional parameter EMA decay. Checkpoints expose EMA weights for inference.",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--fail-on-nonfinite",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop before an optimizer update when loss or gradient norm is non-finite.",
+    )
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=250)
     parser.add_argument("--resume", type=str, default=None)
@@ -673,8 +752,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cache-dtype",
-        choices=("float16", "float32"),
-        default="float16",
+        choices=("bfloat16", "float16", "float32"),
+        default="bfloat16",
         help="Storage dtype for cached embeddings.",
     )
 
@@ -689,7 +768,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder-layers", type=int, default=2)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument(
         "--decoder-cross-attention",
         action=argparse.BooleanOptionalAction,
@@ -853,8 +932,9 @@ def get_device(device_arg: str) -> torch.device:
 
 
 def build_backbone(args: argparse.Namespace, device: torch.device):
+    model_path = resolve_path(args.base_model_path)
     model_cfg = AutoConfig.from_pretrained(
-        resolve_path(args.base_model_path),
+        model_path,
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
     )
@@ -876,22 +956,25 @@ def build_backbone(args: argparse.Namespace, device: torch.device):
     if getattr(model_cfg, "model_revision", None) is not None:
         transformers_loading_kwargs["revision"] = model_cfg.model_revision
 
-    backbone_cls = get_backbone_cls(model_cfg)
-    backbone = backbone_cls(
-        model_name=model_cfg.model_name,
-        tune_llm=False,
-        tune_visual=False,
-        select_layer=getattr(model_cfg, "select_layer", 16),
-        reproject_vision=False,
-        use_flash_attention=use_flash_attention,
-        load_bf16=load_bf16,
-        tune_top_llm_layers=0,
-        trainable_params_fp32=False,
+    model_cfg.use_flash_attention = use_flash_attention
+    model_cfg.load_bf16 = load_bf16
+    full_model = AutoModel.from_pretrained(
+        model_path,
+        config=model_cfg,
         transformers_loading_kwargs=transformers_loading_kwargs,
+        local_files_only=args.local_files_only,
     )
+    if not hasattr(full_model, "backbone"):
+        raise RuntimeError(f"Checkpoint model at {model_path} does not expose model.backbone")
+    backbone = full_model.backbone
     backbone.requires_grad_(False)
     backbone.eval()
-    backbone.to(device)
+    backbone.to(
+        device=device,
+        dtype=torch.bfloat16 if load_bf16 else torch.float32,
+    )
+    del full_model
+    gc.collect()
     return backbone, model_cfg, transformers_loading_kwargs
 
 
@@ -900,45 +983,53 @@ def build_dataset_and_processor(
     model_cfg: Any,
     transformers_loading_kwargs: dict[str, Any],
 ):
-    load_modality_config(args.modality_config_path)
-    embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
-    full_modality_config = MODALITY_CONFIGS[embodiment_tag.value]
-    vl_modality_config = {
-        "video": full_modality_config["video"],
-        "language": full_modality_config["language"],
-    }
-    processor_modality_configs = {embodiment_tag.value: vl_modality_config}
-
-    use_albumentations = getattr(
-        model_cfg,
-        "use_albumentations_transforms",
-        getattr(model_cfg, "use_albumentations", True),
+    model_path = Path(resolve_path(args.base_model_path))
+    processor_path_arg = getattr(args, "processor_path", None)
+    processor_path = (
+        Path(resolve_path(processor_path_arg))
+        if processor_path_arg is not None
+        else resolve_processor_path(model_path)
     )
-    processor = Gr00tN1d7Processor(
-        modality_configs=processor_modality_configs,
-        statistics=None,
-        use_percentiles=getattr(model_cfg, "use_percentiles", True),
-        image_crop_size=getattr(model_cfg, "image_crop_size", None),
-        image_target_size=getattr(model_cfg, "image_target_size", None),
-        shortest_image_edge=getattr(model_cfg, "shortest_image_edge", 256),
-        crop_fraction=getattr(model_cfg, "crop_fraction", 0.95),
-        random_rotation_angle=getattr(model_cfg, "random_rotation_angle", None),
-        color_jitter_params=getattr(model_cfg, "color_jitter_params", None),
-        formalize_language=getattr(model_cfg, "formalize_language", True),
-        model_name=model_cfg.model_name,
-        model_type=getattr(model_cfg, "backbone_model_type", "qwen"),
-        max_state_dim=getattr(model_cfg, "max_state_dim", 132),
-        max_action_dim=getattr(model_cfg, "max_action_dim", 132),
-        max_action_horizon=getattr(model_cfg, "action_horizon", 40),
-        apply_sincos_state_encoding=getattr(model_cfg, "apply_sincos_state_encoding", False),
-        use_albumentations=use_albumentations,
-        extra_augmentation_config=getattr(model_cfg, "extra_augmentation_config", None),
-        use_relative_action=getattr(model_cfg, "use_relative_action", False),
-        exclude_state=getattr(model_cfg, "exclude_state", False),
-        state_dropout_prob=0.0,
-        use_mean_std=getattr(model_cfg, "use_mean_std", False),
+    processor = AutoProcessor.from_pretrained(
+        processor_path,
         transformers_loading_kwargs=transformers_loading_kwargs,
+        model_name=model_cfg.model_name,
     )
+    processor.eval()
+
+    embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
+    checkpoint_modality_configs = processor.get_modality_configs()
+    if embodiment_tag.value not in checkpoint_modality_configs:
+        raise ValueError(
+            f"Checkpoint processor at {processor_path} does not contain embodiment "
+            f"{embodiment_tag.value!r}"
+        )
+    checkpoint_full_config = checkpoint_modality_configs[embodiment_tag.value]
+    vl_modality_config = {
+        "video": checkpoint_full_config["video"],
+        "language": checkpoint_full_config["language"],
+    }
+
+    # The checkpoint processor is authoritative.  An external modality file is
+    # accepted only as an explicit compatibility assertion.
+    load_modality_config(args.modality_config_path)
+    configured_full = MODALITY_CONFIGS[embodiment_tag.value]
+    for group in ("video", "language"):
+        expected = vl_modality_config[group]
+        configured = configured_full[group]
+        expected_signature = (
+            tuple(expected.modality_keys),
+            tuple(expected.delta_indices),
+        )
+        configured_signature = (
+            tuple(configured.modality_keys),
+            tuple(configured.delta_indices),
+        )
+        if configured_signature != expected_signature:
+            raise ValueError(
+                f"External modality config {group}={configured_signature!r} does not match "
+                f"checkpoint processor {expected_signature!r}"
+            )
 
     train_dataset = VLOnlyLeRobotDataset(
         dataset_path=resolve_path(args.dataset_dir),
@@ -1037,6 +1128,75 @@ def pack_vl_tokens(
     return packed, packed_mask, packed_image_mask, original_counts, selected_counts
 
 
+def compact_cached_vl_tokens(
+    packed: torch.Tensor,
+    packed_mask: torch.Tensor,
+    packed_image_mask: torch.Tensor,
+    *,
+    token_scope: TokenScope,
+    max_tokens: int,
+    token_sampling: TokenSampling,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[int]]:
+    """Select and compact cached tokens to the actual batch sequence length."""
+    if max_tokens < 1:
+        raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+    if packed.ndim != 3:
+        raise ValueError(f"Expected packed shape [B, S, D], got {tuple(packed.shape)}")
+    expected_mask_shape = packed.shape[:2]
+    if tuple(packed_mask.shape) != expected_mask_shape:
+        raise ValueError(
+            f"Expected packed_mask shape {expected_mask_shape}, got {tuple(packed_mask.shape)}"
+        )
+    if tuple(packed_image_mask.shape) != expected_mask_shape:
+        raise ValueError(
+            "Expected packed_image_mask shape "
+            f"{expected_mask_shape}, got {tuple(packed_image_mask.shape)}"
+        )
+
+    if token_scope == "image":
+        valid_mask = packed_mask & packed_image_mask
+    elif token_scope == "non_image":
+        valid_mask = packed_mask & ~packed_image_mask
+    else:
+        valid_mask = packed_mask
+
+    selected_indices: list[torch.Tensor] = []
+    original_counts: list[int] = []
+    selected_counts: list[int] = []
+    for batch_idx in range(packed.shape[0]):
+        indices = torch.nonzero(valid_mask[batch_idx], as_tuple=False).flatten()
+        original_counts.append(int(indices.numel()))
+        indices = subsample_indices(indices, max_tokens, token_sampling)
+        selected_indices.append(indices)
+        selected_counts.append(int(indices.numel()))
+
+    compact_len = max(selected_counts, default=0)
+    if compact_len == 0:
+        raise RuntimeError(
+            f"No cached VL tokens found for token_scope={token_scope!r}. "
+            "Use a cache containing the requested token type."
+        )
+
+    batch_size, _, hidden_dim = packed.shape
+    compact = packed.new_zeros((batch_size, compact_len, hidden_dim))
+    compact_mask = torch.zeros(
+        batch_size,
+        compact_len,
+        dtype=torch.bool,
+        device=packed.device,
+    )
+    compact_image_mask = torch.zeros_like(compact_mask)
+    for batch_idx, indices in enumerate(selected_indices):
+        count = int(indices.numel())
+        if count == 0:
+            continue
+        compact[batch_idx, :count] = packed[batch_idx, indices]
+        compact_mask[batch_idx, :count] = True
+        compact_image_mask[batch_idx, :count] = packed_image_mask[batch_idx, indices]
+
+    return compact, compact_mask, compact_image_mask, original_counts, selected_counts
+
+
 def masked_mse_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -1049,6 +1209,12 @@ def masked_mse_loss(
 
 
 def validate_prefix_corruption_args(args: argparse.Namespace) -> None:
+    if args.decoder_prefix_corruption:
+        raise ValueError(
+            "The strict openpi-RLT decoder only receives learned position queries and z_rl; "
+            "--decoder-prefix-corruption is incompatible because no ground-truth decoder "
+            "prefix is consumed."
+        )
     probability_args = {
         "prefix_mask_prob": args.prefix_mask_prob,
         "prefix_span_mask_prob": args.prefix_span_mask_prob,
@@ -1080,6 +1246,39 @@ def validate_prefix_corruption_args(args: argparse.Namespace) -> None:
             "--prefix-corruption-unmasked-loss-weight must be non-negative, "
             f"got {args.prefix_corruption_unmasked_loss_weight}."
         )
+
+
+def validate_optimizer_args(args: argparse.Namespace) -> None:
+    if args.max_steps < 1:
+        raise ValueError(f"--max-steps must be positive, got {args.max_steps}.")
+    if args.learning_rate <= 0:
+        raise ValueError(f"--learning-rate must be positive, got {args.learning_rate}.")
+    if not 0 <= args.min_learning_rate <= args.learning_rate:
+        raise ValueError(
+            "--min-learning-rate must be between zero and --learning-rate, "
+            f"got {args.min_learning_rate}."
+        )
+    if args.warmup_steps < 0:
+        raise ValueError(f"--warmup-steps must be non-negative, got {args.warmup_steps}.")
+    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else args.max_steps
+    if decay_steps <= args.warmup_steps:
+        raise ValueError(
+            "--lr-decay-steps must be greater than --warmup-steps, "
+            f"got {decay_steps} <= {args.warmup_steps}."
+        )
+    if not 0 <= args.adam_beta1 < 1 or not 0 <= args.adam_beta2 < 1:
+        raise ValueError(
+            "--adam-beta1 and --adam-beta2 must be in [0, 1), "
+            f"got ({args.adam_beta1}, {args.adam_beta2})."
+        )
+    if args.adam_eps <= 0:
+        raise ValueError(f"--adam-eps must be positive, got {args.adam_eps}.")
+    if args.ema_decay is not None and not 0 <= args.ema_decay < 1:
+        raise ValueError(f"--ema-decay must be in [0, 1), got {args.ema_decay}.")
+    if args.weight_decay < 0:
+        raise ValueError(f"--weight-decay must be non-negative, got {args.weight_decay}.")
+    if args.grad_clip < 0:
+        raise ValueError(f"--grad-clip must be non-negative, got {args.grad_clip}.")
 
 
 def sample_prefix_span_mask(
@@ -1717,8 +1916,16 @@ def run_zrl_ablation_eval(
             if batches >= args.ablation_eval_batches:
                 break
             batches += 1
-            packed = batch["packed"].to(device=device, dtype=torch.float32, non_blocking=True)
-            packed_mask = batch["packed_mask"].to(device=device, non_blocking=True).bool()
+            packed, packed_mask, _, _, _ = compact_cached_vl_tokens(
+                batch["packed"],
+                batch["packed_mask"].bool(),
+                batch["packed_image_mask"].bool(),
+                token_scope=args.token_scope,
+                max_tokens=args.max_vl_tokens,
+                token_sampling=args.token_sampling,
+            )
+            packed = packed.to(device=device, dtype=torch.float32, non_blocking=True)
+            packed_mask = packed_mask.to(device=device, non_blocking=True)
             valid_tokens = int(packed_mask.sum().detach().cpu())
             total_tokens += valid_tokens
 
@@ -1778,35 +1985,71 @@ def update_learning_rate(
     step: int,
     args: argparse.Namespace,
 ) -> float:
-    if args.warmup_steps > 0 and step <= args.warmup_steps:
-        scale = step / args.warmup_steps
+    update_count = max(step - 1, 0)
+    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else args.max_steps
+    initial_lr = args.learning_rate / (args.warmup_steps + 1)
+    if args.warmup_steps > 0 and update_count < args.warmup_steps:
+        progress = update_count / args.warmup_steps
+        lr = initial_lr + (args.learning_rate - initial_lr) * progress
     else:
-        progress = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
-        scale = 0.5 * (1.0 + np.cos(np.pi * min(1.0, max(0.0, progress))))
-    lr = args.learning_rate * scale
+        progress = (update_count - args.warmup_steps) / max(
+            1,
+            decay_steps - args.warmup_steps,
+        )
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+        lr = args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine
     for group in optimizer.param_groups:
         group["lr"] = lr
     return lr
+
+
+def make_ema_state(autoencoder: VLTokenAutoencoder) -> dict[str, torch.Tensor]:
+    return {name: value.detach().clone() for name, value in autoencoder.state_dict().items()}
+
+
+@torch.no_grad()
+def update_ema_state(
+    ema_state: dict[str, torch.Tensor],
+    autoencoder: VLTokenAutoencoder,
+    decay: float,
+) -> None:
+    current_state = autoencoder.state_dict()
+    if ema_state.keys() != current_state.keys():
+        raise RuntimeError("EMA state keys no longer match the autoencoder state.")
+    for name, ema_value in ema_state.items():
+        current_value = current_state[name].detach()
+        if torch.is_floating_point(ema_value):
+            ema_value.mul_(decay).add_(current_value, alpha=1.0 - decay)
+        else:
+            ema_value.copy_(current_value)
 
 
 def save_checkpoint(
     path: Path,
     step: int,
     autoencoder: VLTokenAutoencoder,
+    ema_state: dict[str, torch.Tensor] | None,
     optimizer: torch.optim.Optimizer,
     ae_config: VLTokenAutoencoderConfig,
     args: argparse.Namespace,
     last_loss: float,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw_state = autoencoder.state_dict()
     payload = {
+        "schema_version": RL_TOKEN_CHECKPOINT_SCHEMA_VERSION,
+        "architecture": RL_TOKEN_ARCHITECTURE,
         "step": step,
-        "autoencoder": autoencoder.state_dict(),
+        "autoencoder": ema_state if ema_state is not None else raw_state,
         "optimizer": optimizer.state_dict(),
         "autoencoder_config": asdict(ae_config),
         "args": vars(args),
         "last_loss": last_loss,
     }
+    if ema_state is not None:
+        payload["autoencoder_raw"] = raw_state
+        payload["ema_decay"] = args.ema_decay
     torch.save(payload, path)
 
 
@@ -1841,11 +2084,15 @@ def maybe_load_checkpoint(
     autoencoder: VLTokenAutoencoder,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-) -> int:
+) -> tuple[int, dict[str, torch.Tensor] | None]:
     if path is None:
-        return 0
+        return 0, None
     ckpt = torch.load(Path(path).expanduser(), map_location=device, weights_only=False)
-    load_autoencoder_state_dict(autoencoder, ckpt["autoencoder"])
+    validate_strict_checkpoint_payload(ckpt)
+    load_autoencoder_state_dict(
+        autoencoder,
+        ckpt.get("autoencoder_raw", ckpt["autoencoder"]),
+    )
     if "optimizer" in ckpt:
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -1853,7 +2100,8 @@ def maybe_load_checkpoint(
             print(
                 f"Skipping optimizer state from checkpoint because the parameter set changed: {exc}"
             )
-    return int(ckpt.get("step", 0))
+    ema_state = ckpt["autoencoder"] if "autoencoder_raw" in ckpt else None
+    return int(ckpt.get("step", 0)), ema_state
 
 
 def autocast_context(device: torch.device, enabled: bool):
@@ -1885,6 +2133,7 @@ def flush_embedding_shard(
     packed_mask = torch.cat(mask_chunks, dim=0).to(dtype=torch.bool, device="cpu")
     packed_image_mask = torch.cat(image_mask_chunks, dim=0).to(dtype=torch.bool, device="cpu")
     filename = f"shard_{shard_id:06d}.pt"
+    shard_path = cache_dir / filename
     torch.save(
         {
             "packed": packed,
@@ -1893,10 +2142,11 @@ def flush_embedding_shard(
             "token_counts": torch.tensor(token_counts, dtype=torch.int32),
             "selected_counts": torch.tensor(selected_counts, dtype=torch.int32),
         },
-        cache_dir / filename,
+        shard_path,
     )
     return {
         "file": filename,
+        "sha256": file_sha256(shard_path),
         "num_samples": int(packed.shape[0]),
         "num_valid_tokens": int(packed_mask.sum().item()),
     }
@@ -1910,6 +2160,8 @@ def precompute_vl_embedding_cache(
     if args.embedding_cache_dir is None:
         raise ValueError("--precompute-vl-embeddings requires --embedding-cache-dir")
 
+    model_path = Path(resolve_path(args.base_model_path))
+    model_fingerprint, model_file_hashes = checkpoint_fingerprint(model_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = Path(args.embedding_cache_dir).expanduser().resolve()
     if cache_dir.exists() and any(cache_dir.iterdir()) and not args.overwrite_cache:
@@ -1939,7 +2191,11 @@ def precompute_vl_embedding_cache(
         pin_memory=(device.type == "cuda"),
     )
 
-    storage_dtype = torch.float16 if args.cache_dtype == "float16" else torch.float32
+    storage_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[args.cache_dtype]
     shards: list[dict[str, Any]] = []
     packed_chunks: list[torch.Tensor] = []
     mask_chunks: list[torch.Tensor] = []
@@ -2050,11 +2306,27 @@ def precompute_vl_embedding_cache(
         shards.append(shard_info)
 
     manifest = {
+        "schema_version": VL_CACHE_SCHEMA_VERSION,
+        "representation_source": "groot_checkpoint_backbone",
+        "feature_tap": VL_CACHE_FEATURE_TAP,
+        "processor_mode": VL_CACHE_PROCESSOR_MODE,
+        "checkpoint_fingerprint": model_fingerprint,
+        "checkpoint_files": model_file_hashes,
         "dataset_dir": str(Path(resolve_path(args.dataset_dir))),
         "modality_config_path": str(Path(args.modality_config_path).expanduser().resolve()),
         "base_model_path": resolve_path(args.base_model_path),
+        "processor_path": str(
+            Path(resolve_path(getattr(args, "processor_path", None))).resolve()
+            if getattr(args, "processor_path", None) is not None
+            else resolve_processor_path(Path(resolve_path(args.base_model_path)))
+        ),
         "vlm_model_path": resolve_path(args.vlm_model_path),
         "instruction": args.instruction,
+        "video_modality_keys": list(train_dataset.video_modality.modality_keys),
+        "language_modality_keys": list(train_dataset.language_modality.modality_keys),
+        "video_backend": args.video_backend,
+        "episode_sampling_rate": float(args.episode_sampling_rate),
+        "dataset_sampling_seed": int(args.seed),
         "token_scope": args.token_scope,
         "token_sampling": args.token_sampling,
         "max_vl_tokens": int(args.max_vl_tokens),
@@ -2064,6 +2336,7 @@ def precompute_vl_embedding_cache(
         "num_valid_tokens": int(total_tokens),
         "shards": shards,
     }
+    manifest["fingerprint"] = canonical_json_sha256(manifest)
     with (cache_dir / "manifest.json").open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2096,6 +2369,7 @@ def main() -> None:
     parser = make_arg_parser()
     args = parser.parse_args()
     validate_prefix_corruption_args(args)
+    validate_optimizer_args(args)
     seed_everything(args.seed)
 
     device = get_device(args.device)
@@ -2114,6 +2388,38 @@ def main() -> None:
         cache_dir = Path(args.embedding_cache_dir).expanduser().resolve()
         with (cache_dir / "manifest.json").open("r", encoding="utf-8") as f:
             cache_manifest = json.load(f)
+        validate_cached_embedding_contract(cache_manifest, args)
+        recorded_cache_fingerprint = cache_manifest.get("fingerprint")
+        cache_material = {
+            key: value for key, value in cache_manifest.items() if key != "fingerprint"
+        }
+        actual_cache_fingerprint = canonical_json_sha256(cache_material)
+        if recorded_cache_fingerprint != actual_cache_fingerprint:
+            raise ValueError(
+                "Embedding cache manifest fingerprint is invalid: "
+                f"recorded={recorded_cache_fingerprint!r} actual={actual_cache_fingerprint!r}"
+            )
+        for shard in cache_manifest.get("shards", []):
+            shard_path = cache_dir / shard["file"]
+            actual_shard_hash = file_sha256(shard_path)
+            if shard.get("sha256") != actual_shard_hash:
+                raise ValueError(
+                    f"Embedding cache shard hash mismatch for {shard_path}: "
+                    f"recorded={shard.get('sha256')!r} actual={actual_shard_hash!r}"
+                )
+        expected_checkpoint_fingerprint, _ = checkpoint_fingerprint(args.base_model_path)
+        if cache_manifest.get("checkpoint_fingerprint") != expected_checkpoint_fingerprint:
+            raise ValueError(
+                "Embedding cache checkpoint fingerprint does not match --base-model-path: "
+                f"cache={cache_manifest.get('checkpoint_fingerprint')!r} "
+                f"current={expected_checkpoint_fingerprint!r}"
+            )
+        args.representation_lineage = {
+            "cache_fingerprint": actual_cache_fingerprint,
+            "checkpoint_fingerprint": expected_checkpoint_fingerprint,
+            "feature_tap": VL_CACHE_FEATURE_TAP,
+            "processor_mode": VL_CACHE_PROCESSOR_MODE,
+        }
         model_cfg = argparse.Namespace(
             model_name=cache_manifest.get("vlm_model_path", "cached-vl-embeddings"),
             backbone_embedding_dim=int(cache_manifest.get("input_dim", 2048)),
@@ -2170,14 +2476,26 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         autoencoder.parameters(),
         lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        eps=args.adam_eps,
         weight_decay=args.weight_decay,
     )
-    start_step = maybe_load_checkpoint(args.resume, autoencoder, optimizer, device)
+    start_step, restored_ema_state = maybe_load_checkpoint(
+        args.resume,
+        autoencoder,
+        optimizer,
+        device,
+    )
+    ema_state = None
+    if args.ema_decay is not None:
+        ema_state = restored_ema_state or make_ema_state(autoencoder)
 
     tracking_config = build_swanlab_config(args, ae_config, model_cfg, autoencoder, device)
     with (output_dir / "training_config.json").open("w", encoding="utf-8") as f:
         json.dump(
             {
+                "schema_version": RL_TOKEN_CHECKPOINT_SCHEMA_VERSION,
+                "architecture": RL_TOKEN_ARCHITECTURE,
                 "args": vars(args),
                 "autoencoder_config": asdict(ae_config),
                 "backbone_model_name": model_cfg.model_name,
@@ -2197,6 +2515,16 @@ def main() -> None:
                 "train/using_embedding_cache": int(using_cache),
                 "train/autoencoder_bf16": int(bool(autoencoder_bf16)),
                 "optimizer/lr_initial": float(args.learning_rate),
+                "optimizer/lr_min": float(args.min_learning_rate),
+                "optimizer/lr_decay_steps": int(
+                    args.lr_decay_steps if args.lr_decay_steps is not None else args.max_steps
+                ),
+                "optimizer/adam_beta1": float(args.adam_beta1),
+                "optimizer/adam_beta2": float(args.adam_beta2),
+                "optimizer/adam_eps": float(args.adam_eps),
+                "optimizer/ema_decay": (
+                    float(args.ema_decay) if args.ema_decay is not None else 0.0
+                ),
                 "optimizer/weight_decay": float(args.weight_decay),
                 "optimizer/grad_clip_norm": float(args.grad_clip),
                 "data/cache_num_samples": int(cache_manifest.get("num_samples", 0))
@@ -2244,13 +2572,19 @@ def main() -> None:
         lr = update_learning_rate(optimizer, step, args)
 
         if using_cache:
-            packed = batch["packed"].to(device=device, dtype=torch.float32, non_blocking=True)
-            packed_mask = batch["packed_mask"].to(device=device, non_blocking=True).bool()
-            packed_image_mask = (
-                batch["packed_image_mask"].to(device=device, non_blocking=True).bool()
+            packed, packed_mask, packed_image_mask, token_counts, selected_counts = (
+                compact_cached_vl_tokens(
+                    batch["packed"],
+                    batch["packed_mask"].bool(),
+                    batch["packed_image_mask"].bool(),
+                    token_scope=args.token_scope,
+                    max_tokens=args.max_vl_tokens,
+                    token_sampling=args.token_sampling,
+                )
             )
-            token_counts = [int(x) for x in batch["token_count"]]
-            selected_counts = [int(x) for x in batch["selected_count"]]
+            packed = packed.to(device=device, dtype=torch.float32, non_blocking=True)
+            packed_mask = packed_mask.to(device=device, non_blocking=True)
+            packed_image_mask = packed_image_mask.to(device=device, non_blocking=True)
         else:
             inputs = batch["inputs"]
             dtype = next(backbone.parameters()).dtype
@@ -2312,6 +2646,9 @@ def main() -> None:
                 prefix_corruption_metrics = None
 
         optimizer.zero_grad(set_to_none=True)
+        if args.fail_on_nonfinite and not bool(torch.isfinite(loss).detach()):
+            loss_value = float(loss.detach().cpu())
+            raise FloatingPointError(f"Non-finite loss at step {step}: {loss_value}")
         loss.backward()
         model_metrics = {}
         if (
@@ -2326,7 +2663,12 @@ def main() -> None:
             )
         else:
             grad_norm_value = grad_global_norm(autoencoder.parameters())
+        if args.fail_on_nonfinite and not math.isfinite(grad_norm_value):
+            optimizer.zero_grad(set_to_none=True)
+            raise FloatingPointError(f"Non-finite gradient norm at step {step}: {grad_norm_value}")
         optimizer.step()
+        if ema_state is not None:
+            update_ema_state(ema_state, autoencoder, args.ema_decay)
         step_seconds = time.time() - step_start
 
         loss_value = float(loss.detach().cpu())
@@ -2374,6 +2716,7 @@ def main() -> None:
                 checkpoint_path_for_step(output_dir, step),
                 step,
                 autoencoder,
+                ema_state,
                 optimizer,
                 ae_config,
                 args,
@@ -2404,6 +2747,7 @@ def main() -> None:
         checkpoint_path_for_step(output_dir, step),
         step,
         autoencoder,
+        ema_state,
         optimizer,
         ae_config,
         args,

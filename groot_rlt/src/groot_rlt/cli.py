@@ -32,6 +32,10 @@ _COMMANDS = {
         "groot_rlt.representation.visualize_rl_token_umap",
         "visualize the learned RL-token space",
     ),
+    "verify-prefix-parity": _Command(
+        "groot_rlt.representation.verify_prefix_parity",
+        "verify cache-time and serving-time GR00T prefix parity",
+    ),
     "serve-features": _Command(
         "groot_rlt.serving.groot_feature_server",
         "serve online GR00T features and reference actions",
