@@ -87,3 +87,13 @@ def test_unknown_command_does_not_import(monkeypatch, capsys):
 
     assert exc_info.value.code == 2
     assert "unknown command" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("argv", "expected"), [([], 1.0), (["--episode-sampling-rate", "0.5"], 0.5)])
+def test_visualize_dataset_parser_supplies_episode_sampling_rate(monkeypatch, argv, expected):
+    from groot_rlt.representation import visualize_rl_token_umap
+
+    monkeypatch.setattr(sys, "argv", ["visualize-token", *argv])
+    args = visualize_rl_token_umap.parse_args()
+
+    assert args.episode_sampling_rate == expected

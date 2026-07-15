@@ -101,6 +101,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-backend", type=str, default="torchcodec")
     parser.add_argument("--episode-indices", type=int, nargs="*", default=None)
     parser.add_argument("--max-episodes", type=int, default=None)
+    parser.add_argument(
+        "--episode-sampling-rate",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of each episode exposed to the dataset loader. Dataset-source "
+            "visualization defaults to every frame before --frame-stride is applied."
+        ),
+    )
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--max-frames-per-episode", type=int, default=None)
     parser.add_argument(
