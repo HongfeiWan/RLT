@@ -191,7 +191,7 @@ def test_groot_nero_example_projects_26d_reference_to_19d_action() -> None:
     system = load_system_config_yaml(str(path))
 
     assert system.rl.action_dim == 19
-    assert system.rl.proprio_dim == 26
+    assert system.rl.proprio_dim == 19
     assert system.rl.z_dim == 2048
     assert system.rl.chunk_len == 10
     assert system.rl.action_representation == "abs"
@@ -204,4 +204,10 @@ def test_groot_nero_example_projects_26d_reference_to_19d_action() -> None:
     assert system.rl.reference_action_indices == tuple(range(19))
     assert system.rl.rot6d_convention == "groot_row_major_first_two_rows"
     assert system.env_driver.machine_a_ws_url == "ws://MACHINE_A_IP:8000"
+    assert system.env_driver.machine_a_allow_unpinned_metadata is False
+    assert system.env_driver.machine_a_expected_backend == "groot-n1.7"
+    assert system.env_driver.machine_a_expected_checkpoint_fingerprint.startswith("sha256:")
+    assert system.env_driver.machine_a_expected_cache_fingerprint.startswith("sha256:")
+    assert system.env_driver.machine_a_expected_encoder_artifact_sha256.startswith("sha256:")
+    assert system.env_driver.machine_a_expected_vlm_content_fingerprint.startswith("sha256:")
     assert system.env_driver.enable_human_override is False

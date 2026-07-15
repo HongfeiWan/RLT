@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import threading
 import time
 from typing import Any, Protocol
@@ -43,6 +44,181 @@ from rlt_online_rl.replay import save_raw_episode
 from rlt_online_rl.runtime_logging import append_jsonl
 
 logger = logging.getLogger(__name__)
+
+_SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_STRICT_RLT_ARCHITECTURE = "openpi_rlt_strict_cross_attention_v1"
+_STRICT_ENCODER_ARCHITECTURE = f"{_STRICT_RLT_ARCHITECTURE}.encoder_only"
+
+
+def _validate_groot_machine_a_metadata(metadata: Mapping[str, Any]) -> None:
+    """Fail closed when a GR00T feature server cannot prove its prefix lineage."""
+
+    contract = metadata.get("rl_token_contract")
+    if not isinstance(contract, Mapping):
+        raise ValueError("GR00T Machine A metadata is missing rl_token_contract")
+    required = {
+        "source_kind",
+        "artifact_kind",
+        "architecture",
+        "source_architecture",
+        "artifact_path",
+        "artifact_manifest_path",
+        "artifact_fingerprint",
+        "artifact_file_sha256",
+        "encoder_tensor_sha256",
+        "representation_checkpoint_file_sha256",
+        "checkpoint_fingerprint",
+        "cache_fingerprint",
+        "representation_checkpoint_schema_version",
+        "prefix_cache_schema_version",
+        "feature_tap",
+        "processor_mode",
+        "prefix_cache_manifest_path",
+        "token_scope",
+        "token_sampling",
+        "max_vl_tokens",
+        "input_dim",
+        "z_dim",
+        "video_modality_keys",
+        "model_path",
+        "processor_path",
+        "vlm_model_path",
+        "vlm_deployment_content_fingerprint",
+        "vlm_fingerprint_scope",
+    }
+    missing = sorted(required - set(contract))
+    if missing:
+        raise ValueError(f"GR00T rl_token_contract is missing fields: {missing}")
+    for name in (
+        "artifact_fingerprint",
+        "artifact_file_sha256",
+        "encoder_tensor_sha256",
+        "representation_checkpoint_file_sha256",
+        "checkpoint_fingerprint",
+        "cache_fingerprint",
+        "vlm_deployment_content_fingerprint",
+    ):
+        if not isinstance(contract[name], str) or _SHA256_PATTERN.fullmatch(contract[name]) is None:
+            raise ValueError(f"GR00T rl_token_contract.{name} is not a SHA-256 fingerprint")
+    if contract["source_architecture"] != _STRICT_RLT_ARCHITECTURE:
+        raise ValueError("GR00T Machine A did not load the strict RLT architecture")
+    source_kind = contract["source_kind"]
+    if source_kind == "encoder_ema_artifact":
+        expected_architecture = _STRICT_ENCODER_ARCHITECTURE
+        expected_kind = "groot_rlt.encoder_ema"
+        if not isinstance(contract["artifact_manifest_path"], str) or not contract["artifact_manifest_path"]:
+            raise ValueError("Encoder-only artifact handshake is missing its manifest path")
+    elif source_kind == "legacy_full_checkpoint":
+        expected_architecture = _STRICT_RLT_ARCHITECTURE
+        expected_kind = "groot_rlt.legacy_full_training_checkpoint"
+        if contract["artifact_manifest_path"] is not None:
+            raise ValueError("Legacy full checkpoint must not advertise an artifact manifest")
+    else:
+        raise ValueError(f"Unsupported GR00T RL-token source_kind={source_kind!r}")
+    if contract["architecture"] != expected_architecture:
+        raise ValueError(
+            f"GR00T RL-token architecture={contract['architecture']!r}, expected={expected_architecture!r}"
+        )
+    if contract["artifact_kind"] != expected_kind:
+        raise ValueError(f"GR00T RL-token artifact_kind={contract['artifact_kind']!r} is invalid")
+    for name in ("artifact_path", "prefix_cache_manifest_path"):
+        if not isinstance(contract[name], str) or not contract[name]:
+            raise ValueError(f"GR00T rl_token_contract.{name} must be a non-empty path")
+    for name in ("model_path", "processor_path", "vlm_model_path"):
+        if not isinstance(contract[name], str) or not contract[name].startswith("/"):
+            raise ValueError(f"GR00T rl_token_contract.{name} must be an absolute path")
+    if contract["vlm_fingerprint_scope"] != "deployment_only_not_representation_training_lineage":
+        raise ValueError("GR00T VLM fingerprint scope is missing or misleading")
+    if contract["representation_checkpoint_schema_version"] != 2:
+        raise ValueError("GR00T representation checkpoint must use lineage schema 2")
+    if contract["prefix_cache_schema_version"] != 2:
+        raise ValueError("GR00T prefix cache must use schema 2")
+    if contract["feature_tap"] != "raw_backbone_pre_action_head":
+        raise ValueError("GR00T prefix feature tap is not serving-equivalent")
+    if contract["processor_mode"] != "eval":
+        raise ValueError("GR00T prefix processor mode must be eval")
+    if contract["token_scope"] not in {"all", "image", "non_image"}:
+        raise ValueError("GR00T token scope is invalid")
+    if contract["token_sampling"] not in {"head", "tail", "uniform"}:
+        raise ValueError("GR00T token sampling must be deterministic")
+    for name in ("max_vl_tokens", "input_dim", "z_dim"):
+        if type(contract[name]) is not int or contract[name] < 1:
+            raise ValueError(f"GR00T rl_token_contract.{name} must be a positive integer")
+    cameras = contract["video_modality_keys"]
+    if (
+        not isinstance(cameras, list)
+        or not cameras
+        or not all(isinstance(camera, str) and camera for camera in cameras)
+        or len(set(cameras)) != len(cameras)
+    ):
+        raise ValueError("GR00T rl_token_contract.video_modality_keys is invalid")
+    for top_level, nested in (
+        ("z_dim", "z_dim"),
+        ("token_scope", "token_scope"),
+        ("token_sampling", "token_sampling"),
+        ("max_vl_tokens", "max_vl_tokens"),
+    ):
+        if metadata.get(top_level) != contract[nested]:
+            raise ValueError(
+                f"GR00T handshake {top_level}={metadata.get(top_level)!r} conflicts with "
+                f"rl_token_contract.{nested}={contract[nested]!r}"
+            )
+
+
+def _validate_machine_a_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    allow_unpinned: bool,
+    expected_backend: str | None,
+    expected_checkpoint_fingerprint: str | None,
+    expected_cache_fingerprint: str | None,
+    expected_encoder_artifact_sha256: str | None,
+    expected_vlm_content_fingerprint: str | None,
+) -> None:
+    """Validate server metadata against an independently configured identity."""
+
+    expected = {
+        "expected_backend": expected_backend,
+        "expected_checkpoint_fingerprint": expected_checkpoint_fingerprint,
+        "expected_cache_fingerprint": expected_cache_fingerprint,
+        "expected_encoder_artifact_sha256": expected_encoder_artifact_sha256,
+        "expected_vlm_content_fingerprint": expected_vlm_content_fingerprint,
+    }
+    if not allow_unpinned:
+        missing = sorted(name for name, value in expected.items() if not value)
+        if missing:
+            raise ValueError(f"Pinned Machine A metadata requires configured values: {missing}")
+    for name, value in expected.items():
+        if name == "expected_backend" or value is None:
+            continue
+        if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"Configured {name} is not a SHA-256 fingerprint")
+
+    backend = metadata.get("backend")
+    if expected_backend is not None and backend != expected_backend:
+        raise ValueError(
+            f"Machine A backend={backend!r} does not match configured {expected_backend!r}"
+        )
+    must_validate_groot = backend == "groot-n1.7" or expected_backend == "groot-n1.7"
+    if not must_validate_groot:
+        if allow_unpinned:
+            return
+        raise ValueError(f"Pinned Machine A backend {backend!r} has no strict validator")
+
+    _validate_groot_machine_a_metadata(metadata)
+    contract = metadata["rl_token_contract"]
+    comparisons = {
+        "checkpoint_fingerprint": expected_checkpoint_fingerprint,
+        "cache_fingerprint": expected_cache_fingerprint,
+        "artifact_file_sha256": expected_encoder_artifact_sha256,
+        "vlm_deployment_content_fingerprint": expected_vlm_content_fingerprint,
+    }
+    for name, expected_value in comparisons.items():
+        if expected_value is not None and contract[name] != expected_value:
+            raise ValueError(
+                f"Machine A rl_token_contract.{name}={contract[name]!r} does not match "
+                f"configured {expected_value!r}"
+            )
 
 
 def _healthz_url_from_ws_url(ws_url: str) -> str:
@@ -295,7 +471,15 @@ def normalize_feature_payload(
     normalized = dict(payload)
     normalized["z_rl"] = _coerce_feature_vector("z_rl", payload["z_rl"], rl_config.z_dim)
     observation_state = observation.get("state")
-    if isinstance(observation_state, Mapping):
+    pinned_proprio = rl_config.proprio_layout_hash is not None
+    if pinned_proprio:
+        if "proprio" not in payload:
+            raise ValueError(
+                "Pinned Machine A proprio contract requires an explicit payload proprio vector; "
+                "the raw observation state cannot be sliced implicitly."
+            )
+        normalized["proprio"] = _coerce_feature_vector("proprio", payload["proprio"], rl_config.proprio_dim)
+    elif isinstance(observation_state, Mapping):
         if "proprio" not in payload:
             raise ValueError("nested GR00T observation state requires Machine A to return a flat proprio vector.")
         normalized["proprio"] = _coerce_feature_vector("proprio", payload["proprio"], rl_config.proprio_dim)
@@ -309,6 +493,25 @@ def normalize_feature_payload(
         if expected is not None and payload.get(payload_key) != expected:
             raise ValueError(
                 f"Machine A {payload_key}={payload.get(payload_key)!r} does not match configured {expected!r}"
+            )
+    if pinned_proprio:
+        layout = payload.get("proprio_layout")
+        if (
+            not isinstance(layout, (list, tuple))
+            or len(layout) != rl_config.proprio_dim
+            or not all(isinstance(name, str) and name for name in layout)
+        ):
+            raise ValueError(
+                f"Machine A proprio_layout must contain {rl_config.proprio_dim} non-empty names"
+            )
+        actual_layout_hash = _semantic_layout_hash(
+            list(layout),
+            rl_config.rot6d_convention,
+        )
+        if actual_layout_hash != rl_config.proprio_layout_hash:
+            raise ValueError(
+                f"Machine A proprio layout hash {actual_layout_hash!r} does not match "
+                f"configured proprio_layout_hash={rl_config.proprio_layout_hash!r}"
             )
     return normalized
 
@@ -710,12 +913,26 @@ class MachineAFeatureClient:
         connect_timeout_sec: float = 5.0,
         recv_timeout_sec: float = 5.0,
         retry_interval_sec: float = 0.5,
+        allow_unpinned_metadata: bool = True,
+        expected_backend: str | None = None,
+        expected_checkpoint_fingerprint: str | None = None,
+        expected_cache_fingerprint: str | None = None,
+        expected_encoder_artifact_sha256: str | None = None,
+        expected_vlm_content_fingerprint: str | None = None,
     ):
         self._ws_url = ws_url
         self._healthz_url = _healthz_url_from_ws_url(ws_url)
         self._connect_timeout_sec = connect_timeout_sec
         self._recv_timeout_sec = recv_timeout_sec
         self._retry_interval_sec = retry_interval_sec
+        self._metadata_expectation = {
+            "allow_unpinned": bool(allow_unpinned_metadata),
+            "expected_backend": expected_backend,
+            "expected_checkpoint_fingerprint": expected_checkpoint_fingerprint,
+            "expected_cache_fingerprint": expected_cache_fingerprint,
+            "expected_encoder_artifact_sha256": expected_encoder_artifact_sha256,
+            "expected_vlm_content_fingerprint": expected_vlm_content_fingerprint,
+        }
         self._packer = msgpack_numpy.Packer()
         self._metadata: dict[str, Any] = {}
         self._ws = self._wait_for_server()
@@ -773,6 +990,7 @@ class MachineAFeatureClient:
                 metadata = msgpack_numpy.unpackb(ws.recv(timeout=self._recv_timeout_sec))
                 if not isinstance(metadata, dict):
                     raise RuntimeError(f"Machine A metadata must be a mapping, got {type(metadata).__name__}.")
+                _validate_machine_a_metadata(metadata, **self._metadata_expectation)
                 self._metadata = dict(metadata)
                 logger.debug("Connected to Machine A feature server at %s", self._ws_url)
                 return ws

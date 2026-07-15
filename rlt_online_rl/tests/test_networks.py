@@ -5,6 +5,7 @@ import sys
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
@@ -18,6 +19,7 @@ from rlt_online_rl.networks import apply_reference_dropout
 from rlt_online_rl.networks import build_td_target
 from rlt_online_rl.networks import compute_actor_loss
 from rlt_online_rl.networks import compute_critic_loss
+from rlt_online_rl.trainer import prepare_replay_training_batch
 
 
 class _OnesActor:
@@ -77,12 +79,12 @@ def test_twin_critic_output_shape() -> None:
     assert q2.shape == (6,)
 
 
-def test_nero_networks_use_19d_actions_with_complete_26d_proprio() -> None:
+def test_nero_networks_use_19d_actions_and_19d_proprio() -> None:
     cfg = RLTOnlineRLConfig(
         action_dim=19,
         chunk_len=10,
         z_dim=8,
-        proprio_dim=26,
+        proprio_dim=19,
         actor_hidden_dim=16,
         critic_hidden_dim=16,
         actor_num_layers=1,
@@ -114,9 +116,51 @@ def test_nero_networks_use_19d_actions_with_complete_26d_proprio() -> None:
     action_chunk = actor.actor_mean(actor_params, z_rl, proprio, ref_chunk)
     q1, q2 = critic.q_values(critic_params, z_rl, proprio, action_chunk)
 
+    assert actor_params["proprio_proj"]["w"].shape[0] == 19
+    assert critic_params["q1"]["proprio_proj"]["w"].shape[0] == 19
+    assert critic_params["q2"]["proprio_proj"]["w"].shape[0] == 19
     assert action_chunk.shape == (2, 10, 19)
     assert q1.shape == (2,)
     assert q2.shape == (2,)
+
+
+def test_nero_replay_training_batch_accepts_19d_and_rejects_26d_proprio() -> None:
+    cfg = RLTOnlineRLConfig(
+        action_dim=19,
+        chunk_len=10,
+        z_dim=8,
+        proprio_dim=19,
+    )
+    batch_size = 2
+    batch = {
+        "z_rl": np.ones((batch_size, cfg.z_dim), dtype=np.float32),
+        "proprio": np.ones((batch_size, 19), dtype=np.float32),
+        "ref_chunk": np.ones((batch_size, cfg.chunk_len, cfg.action_dim), dtype=np.float32),
+        "action_chunk": np.ones((batch_size, cfg.chunk_len, cfg.action_dim), dtype=np.float32),
+        "rewards": np.zeros((batch_size, cfg.chunk_len), dtype=np.float32),
+        "done": np.zeros((batch_size,), dtype=np.bool_),
+        "next_z_rl": np.ones((batch_size, cfg.z_dim), dtype=np.float32),
+        "next_proprio": np.ones((batch_size, 19), dtype=np.float32),
+        "next_ref_chunk": np.ones(
+            (batch_size, cfg.chunk_len, cfg.action_dim),
+            dtype=np.float32,
+        ),
+        "source": np.zeros((batch_size,), dtype=np.uint8),
+        "source_chunk": np.zeros((batch_size, cfg.chunk_len), dtype=np.uint8),
+        "valid_mask": np.ones((batch_size, cfg.chunk_len), dtype=np.bool_),
+        "reference_valid_mask": np.ones((batch_size, cfg.chunk_len), dtype=np.bool_),
+        "next_reference_valid_mask": np.ones((batch_size, cfg.chunk_len), dtype=np.bool_),
+    }
+
+    prepared = prepare_replay_training_batch(batch, cfg)
+    assert prepared["proprio"].shape == (batch_size, 19)
+    assert prepared["next_proprio"].shape == (batch_size, 19)
+
+    wrong_proprio = dict(batch)
+    wrong_proprio["proprio"] = np.ones((batch_size, 26), dtype=np.float32)
+    wrong_proprio["next_proprio"] = np.ones((batch_size, 26), dtype=np.float32)
+    with np.testing.assert_raises_regex(ValueError, "proprio has shape"):
+        prepare_replay_training_batch(wrong_proprio, cfg)
 
 
 def test_reference_dropout_zeroes_entire_chunk() -> None:

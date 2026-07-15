@@ -140,7 +140,34 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--processor-path", type=str, default=None)
     parser.add_argument("--vlm-model-path", type=str, required=True)
-    parser.add_argument("--rl-token-checkpoint", type=str, required=True)
+    encoder_source = parser.add_mutually_exclusive_group(required=True)
+    encoder_source.add_argument(
+        "--rl-token-encoder-artifact",
+        type=str,
+        help="Verified encoder-only EMA artifact (recommended serving path).",
+    )
+    encoder_source.add_argument(
+        "--legacy-rl-token-checkpoint",
+        "--rl-token-checkpoint",
+        dest="legacy_rl_token_checkpoint",
+        type=str,
+        help=(
+            "Explicit trusted full strict checkpoint compatibility path; this is never used "
+            "as a fallback for an artifact load failure."
+        ),
+    )
+    parser.add_argument("--prefix-cache-manifest", type=str, required=True)
+    parser.add_argument("--expected-checkpoint-fingerprint", type=str, required=True)
+    parser.add_argument("--expected-cache-fingerprint", type=str, required=True)
+    parser.add_argument(
+        "--expected-vlm-content-fingerprint",
+        type=str,
+        required=True,
+        help=(
+            "Deployment-time content hash for --vlm-model-path. This protects the current "
+            "deployment but is not retroactively part of representation-training lineage."
+        ),
+    )
     parser.add_argument("--embodiment-tag", type=str, default="new_embodiment")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -148,7 +175,15 @@ def make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--z-dim", type=int, default=2048)
     parser.add_argument("--chunk-len", type=int, default=10)
     parser.add_argument("--action-dim", type=int, default=26)
-    parser.add_argument("--proprio-dim", type=int, default=26)
+    parser.add_argument(
+        "--proprio-dim",
+        type=int,
+        default=19,
+        help=(
+            "Actor/critic proprio dimension. Nero defaults to EEF9+hand10 while the "
+            "frozen 400k model still receives its complete 26D state."
+        ),
+    )
     parser.add_argument("--proprio-key", action="append", default=None)
     parser.add_argument(
         "--image-key",
@@ -174,9 +209,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
         help="Override checkpoint flow denoising steps (use 32 for the validated Nero setup).",
     )
     parser.add_argument("--token-scope", choices=("all", "image", "non_image"), default=None)
-    parser.add_argument(
-        "--token-sampling", choices=("head", "tail", "uniform", "random"), default=None
-    )
+    parser.add_argument("--token-sampling", choices=("head", "tail", "uniform"), default=None)
     parser.add_argument("--max-vl-tokens", type=int, default=None)
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -206,7 +239,12 @@ def main() -> None:
         model_path=model_path,
         processor_path=processor_path,
         vlm_model_path=args.vlm_model_path,
-        rl_token_checkpoint=args.rl_token_checkpoint,
+        prefix_cache_manifest=args.prefix_cache_manifest,
+        expected_checkpoint_fingerprint=args.expected_checkpoint_fingerprint,
+        expected_cache_fingerprint=args.expected_cache_fingerprint,
+        expected_vlm_content_fingerprint=args.expected_vlm_content_fingerprint,
+        rl_token_encoder_artifact=args.rl_token_encoder_artifact,
+        legacy_rl_token_checkpoint=args.legacy_rl_token_checkpoint,
         embodiment_tag=args.embodiment_tag,
         device=args.device,
         contract=contract,
@@ -225,7 +263,7 @@ def main() -> None:
         "groot_repo": str(repo_root),
         "groot_commit": _groot_commit(repo_root),
         "model_path": str(model_path),
-        "rl_token_checkpoint": str(Path(args.rl_token_checkpoint).expanduser().resolve()),
+        "rl_token_contract": dict(backend.rl_token_serving_metadata),
         # The backend currently evaluates one observation at a time. Advertising
         # false keeps replay prefetch from sending a 16-item serial request that
         # exceeds the online client's receive timeout.

@@ -139,6 +139,14 @@ class EnvDriverConfig:
     """Configuration for B4 env_driver."""
 
     machine_a_ws_url: str = "ws://127.0.0.1:8000"
+    # Generic/debug integrations may explicitly retain the historical unpinned
+    # handshake. Nero production configs set this false and supply every value.
+    machine_a_allow_unpinned_metadata: bool = True
+    machine_a_expected_backend: str | None = None
+    machine_a_expected_checkpoint_fingerprint: str | None = None
+    machine_a_expected_cache_fingerprint: str | None = None
+    machine_a_expected_encoder_artifact_sha256: str | None = None
+    machine_a_expected_vlm_content_fingerprint: str | None = None
     actor_service_url: str = "http://127.0.0.1:9101"
     replay_service_url: str = "http://127.0.0.1:9102"
     task_mode: Literal["full_task", "critical_phase"] = "critical_phase"

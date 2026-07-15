@@ -4,11 +4,13 @@ import numpy as np
 import pytest
 
 from groot_rlt.integration.nero_action_contract import (
+    ACTOR_PROPRIO_DIM,
     EXECUTED_ACTION_CHANNEL_NAMES,
     ROT6D_CONVENTION,
     VLA_REFERENCE_CHANNEL_NAMES,
     bridge_v3_executed_action,
     bridge_v3_policy_state_to_machine_a,
+    project_v3_policy_state_to_actor_proprio,
     project_vla_reference_to_executed_action,
     semantic_layout_hash,
 )
@@ -33,6 +35,15 @@ def test_v3_state_bridge_reorders_without_changing_inference_rot6d() -> None:
     np.testing.assert_array_equal(bridged[9:19], hand)
     np.testing.assert_array_equal(bridged[19:26], arm)
     np.testing.assert_array_equal(bridged[3:9], v3_state[10:16])
+
+    actor_proprio = project_v3_policy_state_to_actor_proprio(
+        v3_state,
+        rotation_convention=ROT6D_CONVENTION,
+    )
+    assert actor_proprio.shape == (ACTOR_PROPRIO_DIM,)
+    np.testing.assert_array_equal(actor_proprio[:9], eef)
+    np.testing.assert_array_equal(actor_proprio[9:], hand)
+    assert not np.isin(arm, actor_proprio).all()
 
 
 def test_v3_bridge_rejects_unvalidated_rotation_convention() -> None:

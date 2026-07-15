@@ -14,6 +14,7 @@ from groot_rlt.integration.lerobot_v3_replay_bridge import (
     ReplayFrameFeatures,
     ReplaySource,
     build_lerobot_v3_replay_bundle,
+    inspect_lerobot_v3_replay_source,
     open_official_lerobot_dataset,
     write_replay_bundle,
 )
@@ -183,6 +184,41 @@ class _FeatureProvider:
 
 
 class LeRobotV3ReplayBridgeTest(unittest.TestCase):
+    def test_source_inspection_yields_first_approval_fingerprint_without_features(self) -> None:
+        partitions = [
+            "policy_rollout",
+            "policy_rollout",
+            "human_correction",
+            "human_correction",
+        ]
+        rows = _rows(partitions)
+        inspected = inspect_lerobot_v3_replay_source(
+            rows,
+            info_payload=_info(total_frames=len(rows)),
+            recap_payload=_recap(episode_lengths=[len(rows)]),
+        )
+
+        provider = _FeatureProvider()
+        bundle = build_lerobot_v3_replay_bundle(
+            rows,
+            info_payload=_info(total_frames=len(rows)),
+            recap_payload=_recap(episode_lengths=[len(rows)]),
+            feature_provider=provider,
+            feature_contract_fingerprint=_FEATURE_FINGERPRINT,
+            expected_dataset_fingerprint=inspected["dataset_fingerprint"],
+        )
+        self.assertEqual(inspected["dataset_fingerprint"], bundle.dataset_fingerprint)
+        self.assertEqual(inspected["source_frame_count"], 4)
+        self.assertEqual(inspected["episode_count"], 1)
+        self.assertEqual(inspected["partition_run_count"], 2)
+        self.assertEqual(inspected["replay_segment_count"], 2)
+        self.assertEqual(inspected["replay_step_count"], 3)
+        self.assertEqual(inspected["dropped_boundary_frame_count"], 1)
+        self.assertEqual(
+            inspected["partition_frame_counts"],
+            {"policy_rollout": 2, "human_correction": 2, "human_demo": 0},
+        )
+
     def test_bridge_splits_partitions_and_preserves_real_action_contract(self) -> None:
         partitions = [
             "policy_rollout",
@@ -229,11 +265,30 @@ class LeRobotV3ReplayBridgeTest(unittest.TestCase):
 
         np.testing.assert_array_equal(correction.steps[0].action, rows[2]["action"])
         np.testing.assert_array_equal(correction.steps[0].ref_action, _action(2))
-        source_state = rows[2]["observation.state"]
-        expected_proprio = np.concatenate(
-            (source_state[7:16], source_state[16:26], source_state[0:7])
+        expected_full_reference = np.concatenate(
+            (_action(2), np.arange(7, dtype=np.float32) + 500.0)
         )
+        np.testing.assert_array_equal(
+            correction.steps[0].vla_reference_action,
+            expected_full_reference,
+        )
+        np.testing.assert_array_equal(
+            correction.steps[0].ref_action,
+            correction.steps[0].vla_reference_action[:19],
+        )
+        source_state = rows[2]["observation.state"]
+        expected_proprio = np.concatenate((source_state[7:16], source_state[16:26]))
         np.testing.assert_array_equal(correction.steps[0].proprio, expected_proprio)
+        state_contract = bundle.manifest()["state_contract"]
+        self.assertEqual(state_contract["source_dim"], 26)
+        self.assertEqual(state_contract["runtime_dim"], 19)
+        self.assertEqual(state_contract["projection"], list(range(7, 26)))
+        self.assertEqual(state_contract["runtime_order"], "eef9+hand10")
+        reference_contract = bundle.manifest()["reference_contract"]
+        self.assertEqual(reference_contract["source_order"], "eef9+hand10+arm7")
+        self.assertEqual(reference_contract["runtime_order"], "eef9+hand10")
+        self.assertEqual(reference_contract["projection"], list(range(19)))
+        self.assertFalse(reference_contract["learner_consumes_source"])
 
         terminal = demo.steps[-1]
         self.assertTrue(terminal.done)
@@ -243,6 +298,7 @@ class LeRobotV3ReplayBridgeTest(unittest.TestCase):
         self.assertEqual(bundle.outcome_counts, {"success": 1, "failure": 0})
 
         payload = bundle.to_payload()
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(len(payload["episodes"]), 3)
         self.assertEqual(
             payload["manifest"]["partition_boundary_policy"], "split_and_drop_nonterminal_tail"
@@ -252,6 +308,10 @@ class LeRobotV3ReplayBridgeTest(unittest.TestCase):
         self.assertEqual(mapped_step["source_frame_index"], 2)
         self.assertEqual(mapped_step["dataset_fingerprint"], bundle.dataset_fingerprint)
         self.assertEqual(mapped_step["segment_id"], payload["episodes"][1]["segment_id"])
+        np.testing.assert_array_equal(
+            mapped_step["vla_reference_action"][:19],
+            mapped_step["ref_action"],
+        )
 
     def test_failure_episode_is_explicit_terminal_with_zero_reward(self) -> None:
         rows = _rows(["policy_rollout", "policy_rollout"], label="failure")

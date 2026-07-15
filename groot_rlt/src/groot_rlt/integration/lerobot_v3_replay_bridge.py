@@ -32,18 +32,23 @@ from typing import Any, Protocol
 import numpy as np
 
 from groot_rlt.integration.nero_action_contract import (
+    ACTOR_PROPRIO_CHANNEL_NAMES,
+    ACTOR_PROPRIO_DIM,
     EXECUTED_ACTION_DIM,
     ROT6D_CONVENTION,
     V3_STATE_DIM,
+    V3_TO_ACTOR_PROPRIO_INDICES,
     VLA_REFERENCE_DIM,
+    VLA_TO_EXECUTED_ACTION_INDICES,
     bridge_v3_executed_action,
-    bridge_v3_policy_state_to_machine_a,
+    project_v3_policy_state_to_actor_proprio,
     project_vla_reference_to_executed_action,
+    semantic_layout_hash,
 )
 from groot_rlt.integration.online_stats import modality_from_lerobot_v3_metadata
 
 BRIDGE_SCHEMA_NAME = "groot_rlt.lerobot_v3_dagger_replay"
-BRIDGE_SCHEMA_VERSION = 1
+BRIDGE_SCHEMA_VERSION = 2
 
 _EXPECTED_V3_SCHEMA_VERSION = "teleop_stack.lerobot_v3_dagger.v1"
 _FINGERPRINT_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -141,6 +146,7 @@ class ReplayBridgeStep:
 
     z_rl: np.ndarray
     proprio: np.ndarray
+    vla_reference_action: np.ndarray
     ref_action: np.ndarray
     action: np.ndarray
     reward: float
@@ -171,6 +177,7 @@ class ReplayBridgeStep:
         return {
             "z_rl": self.z_rl.copy(),
             "proprio": self.proprio.copy(),
+            "vla_reference_action": self.vla_reference_action.copy(),
             "ref_action": self.ref_action.copy(),
             "action": self.action.copy(),
             "reward": float(self.reward),
@@ -270,10 +277,16 @@ class ReplayBridgeBundle:
             "fps": float(self.fps),
             "state_contract": {
                 "source_dim": V3_STATE_DIM,
-                "runtime_dim": V3_STATE_DIM,
+                "runtime_dim": ACTOR_PROPRIO_DIM,
                 "rotation_convention": ROT6D_CONVENTION,
                 "source_order": "arm7+eef9+hand10",
-                "runtime_order": "eef9+hand10+arm7",
+                "runtime_order": "eef9+hand10",
+                "projection": list(V3_TO_ACTOR_PROPRIO_INDICES),
+                "runtime_layout": list(ACTOR_PROPRIO_CHANNEL_NAMES),
+                "runtime_layout_hash": semantic_layout_hash(
+                    ACTOR_PROPRIO_CHANNEL_NAMES,
+                    rotation_convention=ROT6D_CONVENTION,
+                ),
                 "rotation_transposed": False,
             },
             "action_contract": {
@@ -284,7 +297,12 @@ class ReplayBridgeBundle:
             "reference_contract": {
                 "source_dimension": VLA_REFERENCE_DIM,
                 "runtime_dimension": EXECUTED_ACTION_DIM,
-                "projection": list(range(EXECUTED_ACTION_DIM)),
+                "projection": list(VLA_TO_EXECUTED_ACTION_INDICES),
+                "source_order": "eef9+hand10+arm7",
+                "runtime_order": "eef9+hand10",
+                "source_field": "vla_reference_action",
+                "runtime_field": "ref_action",
+                "learner_consumes_source": False,
             },
             "source_frame_count": int(self.source_frame_count),
             "replay_step_count": int(self.replay_step_count),
@@ -332,6 +350,7 @@ class _ValidatedFrame:
     reward: float
     done: bool
     z_rl: np.ndarray | None = None
+    vla_reference_action: np.ndarray | None = None
     ref_action: np.ndarray | None = None
 
 
@@ -632,7 +651,8 @@ def _validate_row(row: Mapping[str, Any], *, position: int, fps: float) -> _Vali
     )
     if behavior_source != contract["behavior_source"]:
         raise ValueError(
-            f"{prefix} behavior_source {behavior_source!r} does not match partition {partition.value!r}"
+            f"{prefix} behavior_source {behavior_source!r} does not match partition "
+            f"{partition.value!r}"
         )
     advantage_label_rule = _strict_string(
         row["teleop_stack.advantage_label_rule"],
@@ -655,7 +675,7 @@ def _validate_row(row: Mapping[str, Any], *, position: int, fps: float) -> _Vali
 
     state = np.asarray(_to_numpy(row["observation.state"]), dtype=np.float32)
     action = np.asarray(_to_numpy(row["action"]), dtype=np.float32)
-    proprio = bridge_v3_policy_state_to_machine_a(
+    proprio = project_v3_policy_state_to_actor_proprio(
         state,
         rotation_convention=ROT6D_CONVENTION,
     )
@@ -717,7 +737,8 @@ def _validate_episodes(
         expected_length = int(sidecar["length"])
         if len(episode_frames) != expected_length:
             raise ValueError(
-                f"episode {episode_index} has {len(episode_frames)} rows, expected {expected_length}"
+                f"episode {episode_index} has {len(episode_frames)} rows, "
+                f"expected {expected_length}"
             )
         actual_indices = [frame.frame_index for frame in episode_frames]
         if actual_indices != list(range(expected_length)):
@@ -781,11 +802,92 @@ def _dataset_fingerprint(
     return f"sha256:{hasher.hexdigest()}"
 
 
+def _validated_source_dataset(
+    loader: Any,
+    *,
+    info_payload: Mapping[str, Any],
+    recap_payload: Mapping[str, Any],
+) -> tuple[
+    float,
+    dict[int, Mapping[str, Any]],
+    list[_ValidatedFrame],
+    dict[int, list[_ValidatedFrame]],
+    str,
+]:
+    fps, sidecars, total_frames = _validate_metadata(info_payload, recap_payload)
+    frames = [
+        _validate_row(row, position=position, fps=fps)
+        for position, row in enumerate(_iter_loader_rows(loader))
+    ]
+    episodes = _validate_episodes(frames, sidecars=sidecars, total_frames=total_frames)
+    return (
+        fps,
+        sidecars,
+        frames,
+        episodes,
+        _dataset_fingerprint(info_payload, recap_payload, frames),
+    )
+
+
+def inspect_lerobot_v3_replay_source(
+    loader: Any,
+    *,
+    info_payload: Mapping[str, Any],
+    recap_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate source rows and return the fingerprint needed for first approval.
+
+    This performs the same metadata, row, episode, terminal, action, and state
+    validation as :func:`build_lerobot_v3_replay_bundle`, but never invokes a
+    feature provider or the 400k policy.
+    """
+
+    fps, sidecars, frames, episodes, dataset_fingerprint = _validated_source_dataset(
+        loader,
+        info_payload=info_payload,
+        recap_payload=recap_payload,
+    )
+    partition_frame_counts = {partition.value: 0 for partition in TrainingPartition}
+    partition_run_counts = {partition.value: 0 for partition in TrainingPartition}
+    replay_segment_count = 0
+    replay_step_count = 0
+    dropped_boundary_frame_count = 0
+    for episode_frames in episodes.values():
+        for run in _partition_runs(episode_frames):
+            partition = run[0].partition.value
+            partition_run_counts[partition] += 1
+            partition_frame_counts[partition] += len(run)
+            valid_step_count = len(run) if run[-1].done else len(run) - 1
+            if not run[-1].done:
+                dropped_boundary_frame_count += 1
+            if valid_step_count > 0:
+                replay_segment_count += 1
+                replay_step_count += valid_step_count
+    if replay_segment_count == 0:
+        raise ValueError("no replay steps remain after partition-boundary safety filtering")
+    outcome_counts = {"success": 0, "failure": 0}
+    for sidecar in sidecars.values():
+        outcome_counts[str(sidecar["terminal_label"])] += 1
+    return {
+        "dataset_fingerprint": dataset_fingerprint,
+        "fps": fps,
+        "source_frame_count": len(frames),
+        "episode_count": len(episodes),
+        "partition_run_count": sum(partition_run_counts.values()),
+        "replay_segment_count": replay_segment_count,
+        "replay_step_count": replay_step_count,
+        "dropped_boundary_frame_count": dropped_boundary_frame_count,
+        "partition_frame_counts": partition_frame_counts,
+        "partition_run_counts": partition_run_counts,
+        "outcome_counts": outcome_counts,
+    }
+
+
 def _resolve_features(
     result: ReplayFrameFeatures | Mapping[str, Any],
     *,
     identity: FrameIdentity,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if isinstance(result, ReplayFrameFeatures):
         z_value = result.z_rl
         reference_value = result.vla_reference_action
@@ -815,7 +917,7 @@ def _resolve_features(
             f"got {reference.shape}"
         )
     projected = project_vla_reference_to_executed_action(reference)
-    return z_rl.copy(), projected
+    return z_rl.copy(), reference.copy(), projected
 
 
 def _feature_fingerprint(
@@ -824,11 +926,12 @@ def _feature_fingerprint(
     frames: Sequence[_ValidatedFrame],
 ) -> str:
     hasher = hashlib.sha256()
-    _update_hash(hasher, b"groot-rlt-lerobot-v3-replay-features-v1")
+    _update_hash(hasher, b"groot-rlt-lerobot-v3-replay-features-v2")
     _update_hash(hasher, dataset_fingerprint.encode("ascii"))
     _update_hash(hasher, feature_contract_fingerprint.encode("ascii"))
     for frame in frames:
         assert frame.z_rl is not None
+        assert frame.vla_reference_action is not None
         assert frame.ref_action is not None
         _update_hash(
             hasher,
@@ -838,6 +941,10 @@ def _feature_fingerprint(
             ),
         )
         _update_hash(hasher, np.asarray(frame.z_rl, dtype="<f4").tobytes(order="C"))
+        _update_hash(
+            hasher,
+            np.asarray(frame.vla_reference_action, dtype="<f4").tobytes(order="C"),
+        )
         _update_hash(hasher, np.asarray(frame.ref_action, dtype="<f4").tobytes(order="C"))
     return f"sha256:{hasher.hexdigest()}"
 
@@ -878,6 +985,7 @@ def _build_segments(
                     dropped_boundary_frames += 1
                     continue
                 assert frame.z_rl is not None
+                assert frame.vla_reference_action is not None
                 assert frame.ref_action is not None
                 assert next_frame.z_rl is not None
                 contract = _PARTITION_CONTRACT[frame.partition]
@@ -885,6 +993,7 @@ def _build_segments(
                     ReplayBridgeStep(
                         z_rl=frame.z_rl.copy(),
                         proprio=frame.proprio.copy(),
+                        vla_reference_action=frame.vla_reference_action.copy(),
                         ref_action=frame.ref_action.copy(),
                         action=frame.action.copy(),
                         reward=frame.reward,
@@ -968,13 +1077,11 @@ def build_lerobot_v3_replay_bundle(
             "expected_dataset_fingerprint", expected_dataset_fingerprint
         )
 
-    fps, sidecars, total_frames = _validate_metadata(info_payload, recap_payload)
-    frames = [
-        _validate_row(row, position=position, fps=fps)
-        for position, row in enumerate(_iter_loader_rows(loader))
-    ]
-    episodes = _validate_episodes(frames, sidecars=sidecars, total_frames=total_frames)
-    dataset_fingerprint = _dataset_fingerprint(info_payload, recap_payload, frames)
+    fps, sidecars, frames, episodes, dataset_fingerprint = _validated_source_dataset(
+        loader,
+        info_payload=info_payload,
+        recap_payload=recap_payload,
+    )
     if (
         expected_dataset_fingerprint is not None
         and dataset_fingerprint != expected_dataset_fingerprint
@@ -995,7 +1102,11 @@ def build_lerobot_v3_replay_bundle(
         )
         try:
             result = feature_provider(identity, frame.raw_row)
-            frame.z_rl, frame.ref_action = _resolve_features(result, identity=identity)
+            (
+                frame.z_rl,
+                frame.vla_reference_action,
+                frame.ref_action,
+            ) = _resolve_features(result, identity=identity)
         except Exception as exc:
             raise ValueError(
                 f"feature generation failed for episode={frame.episode_index} "

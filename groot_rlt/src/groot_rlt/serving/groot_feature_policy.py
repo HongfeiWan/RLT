@@ -6,15 +6,233 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 import numpy as np
 
+from groot_rlt.integration.artifact_lineage import (
+    canonical_json_sha256,
+    checkpoint_fingerprint,
+    file_sha256,
+)
 from groot_rlt.integration.nero_action_contract import (
+    ACTOR_PROPRIO_CHANNEL_NAMES,
+    ACTOR_PROPRIO_DIM,
     ROT6D_CONVENTION,
     VLA_REFERENCE_CHANNEL_NAMES,
     semantic_layout_hash,
 )
+from groot_rlt.integration.prefix_cache_contract import (
+    PrefixCacheContract,
+    load_prefix_cache_contract,
+    require_sha256,
+    validate_prefix_cache_deployment_paths,
+    vlm_content_fingerprint,
+)
+from groot_rlt.representation.encoder_artifact import (
+    ENCODER_ARCHITECTURE,
+    ENCODER_ARTIFACT_KIND,
+    FEATURE_TAP,
+    PROCESSOR_MODE,
+    SOURCE_ARCHITECTURE,
+    load_encoder_ema_artifact,
+    tensor_state_sha256,
+)
+
+_LINEAGE_KEYS = {
+    "cache_fingerprint",
+    "checkpoint_fingerprint",
+    "feature_tap",
+    "processor_mode",
+}
+
+
+@dataclass(frozen=True)
+class LoadedServingEncoder:
+    """Encoder plus the immutable metadata advertised in the Machine-A handshake."""
+
+    encoder: Any
+    checkpoint_args: dict[str, Any]
+    handshake: dict[str, Any]
+
+
+def _validate_representation_lineage(
+    checkpoint_args: Mapping[str, Any],
+    *,
+    expected_checkpoint_fingerprint: str,
+    expected_cache_fingerprint: str,
+) -> dict[str, Any]:
+    lineage = checkpoint_args.get("representation_lineage")
+    if not isinstance(lineage, Mapping):
+        raise ValueError(
+            "Legacy full checkpoint lacks args.representation_lineage; "
+            "historical schema1 checkpoints cannot be served against a schema2 prefix"
+        )
+    lineage = dict(lineage)
+    missing = sorted(_LINEAGE_KEYS - set(lineage))
+    unexpected = sorted(set(lineage) - _LINEAGE_KEYS)
+    if missing or unexpected:
+        raise ValueError(
+            "Legacy checkpoint representation_lineage keys mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if lineage["checkpoint_fingerprint"] != expected_checkpoint_fingerprint:
+        raise ValueError("Legacy checkpoint 400k fingerprint does not match deployment")
+    if lineage["cache_fingerprint"] != expected_cache_fingerprint:
+        raise ValueError("Legacy checkpoint prefix-cache fingerprint does not match deployment")
+    if lineage["feature_tap"] != FEATURE_TAP or lineage["processor_mode"] != PROCESSOR_MODE:
+        raise ValueError("Legacy checkpoint was trained from a non-serving-equivalent prefix")
+    return lineage
+
+
+def _encoder_state_from_full_model(encoder: Any) -> dict[str, Any]:
+    state = encoder.state_dict()
+    selected = {
+        name: value
+        for name, value in state.items()
+        if name in {"query_token", "encoder_memory_pos"}
+        or name.startswith("input_proj.")
+        or name.startswith("encoder.")
+    }
+    if not selected:
+        raise ValueError("Legacy checkpoint has no strict encoder state")
+    return selected
+
+
+def load_serving_rl_token_encoder(
+    *,
+    encoder_artifact: str | Path | None,
+    legacy_full_checkpoint: str | Path | None,
+    expected_checkpoint_fingerprint: str,
+    expected_cache_fingerprint: str,
+    cache_contract: PrefixCacheContract,
+    device: Any,
+) -> LoadedServingEncoder:
+    """Load exactly one explicit encoder source; never fall back after a load error."""
+
+    expected_checkpoint_fingerprint = require_sha256(
+        expected_checkpoint_fingerprint, "expected_checkpoint_fingerprint"
+    )
+    expected_cache_fingerprint = require_sha256(
+        expected_cache_fingerprint, "expected_cache_fingerprint"
+    )
+    if (encoder_artifact is None) == (legacy_full_checkpoint is None):
+        raise ValueError(
+            "Exactly one of encoder_artifact or legacy_full_checkpoint must be provided"
+        )
+    if cache_contract.checkpoint_fingerprint != expected_checkpoint_fingerprint:
+        raise ValueError("Cache contract and expected 400k fingerprints differ")
+    if cache_contract.fingerprint != expected_cache_fingerprint:
+        raise ValueError("Cache contract and expected cache fingerprints differ")
+
+    if encoder_artifact is not None:
+        artifact_path = Path(encoder_artifact).expanduser().resolve()
+        loaded = load_encoder_ema_artifact(
+            artifact_path,
+            expected_checkpoint_fingerprint=expected_checkpoint_fingerprint,
+            expected_cache_fingerprint=expected_cache_fingerprint,
+            device=device,
+        )
+        encoder = loaded.encoder
+        if encoder.config.input_dim != cache_contract.input_dim:
+            raise ValueError(
+                f"Encoder input_dim={encoder.config.input_dim} differs from prefix-cache "
+                f"input_dim={cache_contract.input_dim}"
+            )
+        if encoder.config.max_vl_tokens != cache_contract.max_vl_tokens:
+            raise ValueError(
+                f"Encoder max_vl_tokens={encoder.config.max_vl_tokens} differs from "
+                f"prefix-cache max_vl_tokens={cache_contract.max_vl_tokens}"
+            )
+        manifest = json.loads(loaded.manifest_path.read_text(encoding="utf-8"))
+        handshake = {
+            "source_kind": "encoder_ema_artifact",
+            "artifact_kind": ENCODER_ARTIFACT_KIND,
+            "architecture": ENCODER_ARCHITECTURE,
+            "source_architecture": SOURCE_ARCHITECTURE,
+            "artifact_path": str(loaded.artifact_path),
+            "artifact_manifest_path": str(loaded.manifest_path),
+            "artifact_fingerprint": manifest["metadata_sha256"],
+            "artifact_file_sha256": manifest["artifact_sha256"],
+            "encoder_tensor_sha256": manifest["encoder_state_sha256"],
+            "representation_checkpoint_file_sha256": manifest["source_checkpoint_sha256"],
+        }
+        checkpoint_args: dict[str, Any] = {}
+    else:
+        # Importing this path is intentionally explicit: it allocates the decoder and
+        # unpickles the full trusted training checkpoint. Artifact errors never reach it.
+        import torch
+
+        from groot_rlt.representation.visualize_rl_token_umap import load_rl_token_encoder
+
+        checkpoint_path = Path(legacy_full_checkpoint).expanduser().resolve()
+        encoder, checkpoint_args, _, _ = load_rl_token_encoder(
+            checkpoint_path,
+            torch.device(device),
+        )
+        _validate_representation_lineage(
+            checkpoint_args,
+            expected_checkpoint_fingerprint=expected_checkpoint_fingerprint,
+            expected_cache_fingerprint=expected_cache_fingerprint,
+        )
+        for name, expected in (
+            ("token_scope", cache_contract.token_scope),
+            ("token_sampling", cache_contract.token_sampling),
+            ("max_vl_tokens", cache_contract.max_vl_tokens),
+        ):
+            if checkpoint_args.get(name) != expected:
+                raise ValueError(
+                    f"Legacy checkpoint {name}={checkpoint_args.get(name)!r} differs "
+                    f"from prefix cache {expected!r}"
+                )
+        if encoder.config.input_dim != cache_contract.input_dim:
+            raise ValueError("Legacy encoder input dimension differs from prefix cache")
+        checkpoint_file_sha256 = f"sha256:{file_sha256(checkpoint_path)}"
+        encoder_tensor_sha256 = tensor_state_sha256(_encoder_state_from_full_model(encoder))
+        legacy_material = {
+            "architecture": SOURCE_ARCHITECTURE,
+            "checkpoint_file_sha256": checkpoint_file_sha256,
+            "encoder_tensor_sha256": encoder_tensor_sha256,
+            "checkpoint_fingerprint": expected_checkpoint_fingerprint,
+            "cache_fingerprint": expected_cache_fingerprint,
+            "representation_checkpoint_schema_version": 2,
+            "prefix_cache_schema_version": 2,
+        }
+        handshake = {
+            "source_kind": "legacy_full_checkpoint",
+            "artifact_kind": "groot_rlt.legacy_full_training_checkpoint",
+            "architecture": SOURCE_ARCHITECTURE,
+            "source_architecture": SOURCE_ARCHITECTURE,
+            "artifact_path": str(checkpoint_path),
+            "artifact_manifest_path": None,
+            "artifact_fingerprint": canonical_json_sha256(legacy_material),
+            "artifact_file_sha256": checkpoint_file_sha256,
+            "encoder_tensor_sha256": encoder_tensor_sha256,
+            "representation_checkpoint_file_sha256": checkpoint_file_sha256,
+        }
+
+    handshake.update(
+        {
+            "checkpoint_fingerprint": expected_checkpoint_fingerprint,
+            "cache_fingerprint": expected_cache_fingerprint,
+            "representation_checkpoint_schema_version": 2,
+            "prefix_cache_schema_version": 2,
+            "feature_tap": cache_contract.feature_tap,
+            "processor_mode": cache_contract.processor_mode,
+            "prefix_cache_manifest_path": cache_contract.manifest_path,
+            "token_scope": cache_contract.token_scope,
+            "token_sampling": cache_contract.token_sampling,
+            "max_vl_tokens": cache_contract.max_vl_tokens,
+            "input_dim": cache_contract.input_dim,
+            "z_dim": int(encoder.config.rl_token_dim),
+            "video_modality_keys": list(cache_contract.video_modality_keys),
+        }
+    )
+    return LoadedServingEncoder(
+        encoder=encoder,
+        checkpoint_args=checkpoint_args,
+        handshake=handshake,
+    )
 
 
 class FeatureBackend(Protocol):
@@ -28,7 +246,7 @@ class FeatureContract:
     z_dim: int = 2048
     chunk_len: int = 10
     action_dim: int = 26
-    proprio_dim: int = 26
+    proprio_dim: int = 19
 
     def validate(self) -> None:
         for name in ("z_dim", "chunk_len", "action_dim", "proprio_dim"):
@@ -139,10 +357,15 @@ class GrootN1d7FeatureBackend:
         model_path: str | Path,
         processor_path: str | Path,
         vlm_model_path: str | Path,
-        rl_token_checkpoint: str | Path,
+        prefix_cache_manifest: str | Path,
+        expected_checkpoint_fingerprint: str,
+        expected_cache_fingerprint: str,
+        expected_vlm_content_fingerprint: str,
         embodiment_tag: str,
         device: str,
         contract: FeatureContract,
+        rl_token_encoder_artifact: str | Path | None = None,
+        legacy_rl_token_checkpoint: str | Path | None = None,
         strict: bool = True,
         token_scope: str | None = None,
         token_sampling: str | None = None,
@@ -159,75 +382,123 @@ class GrootN1d7FeatureBackend:
             PrecomputeCheckpointRokaePolicy,
         )
         from groot_rlt.representation.train_vl_embedding_autoencoder import pack_vl_tokens
-        from groot_rlt.representation.visualize_rl_token_umap import load_rl_token_encoder
 
         contract.validate()
         self.contract = contract
         self.device = torch.device(device)
+        expected_checkpoint_fingerprint = require_sha256(
+            expected_checkpoint_fingerprint,
+            "expected_checkpoint_fingerprint",
+        )
+        expected_cache_fingerprint = require_sha256(
+            expected_cache_fingerprint,
+            "expected_cache_fingerprint",
+        )
+        expected_vlm_content_fingerprint = require_sha256(
+            expected_vlm_content_fingerprint,
+            "expected_vlm_content_fingerprint",
+        )
+        cache_contract = load_prefix_cache_contract(
+            prefix_cache_manifest,
+            expected_cache_fingerprint=expected_cache_fingerprint,
+            expected_checkpoint_fingerprint=expected_checkpoint_fingerprint,
+        )
+        model_path, processor_path, vlm_model_path = validate_prefix_cache_deployment_paths(
+            cache_contract,
+            model_path=model_path,
+            processor_path=processor_path,
+            vlm_model_path=vlm_model_path,
+            context="Serving",
+        )
+        actual_checkpoint_fingerprint, _ = checkpoint_fingerprint(model_path)
+        if actual_checkpoint_fingerprint != expected_checkpoint_fingerprint:
+            raise ValueError(
+                "Serving GR00T checkpoint fingerprint mismatch: "
+                f"model={actual_checkpoint_fingerprint} "
+                f"expected={expected_checkpoint_fingerprint}"
+            )
+        actual_vlm_content_fingerprint = vlm_content_fingerprint(vlm_model_path)
+        if actual_vlm_content_fingerprint != expected_vlm_content_fingerprint:
+            raise ValueError(
+                "Serving VLM deployment content fingerprint mismatch: "
+                f"actual={actual_vlm_content_fingerprint} "
+                f"expected={expected_vlm_content_fingerprint}"
+            )
         self.policy = PrecomputeCheckpointRokaePolicy(
-            model_path=Path(model_path).expanduser().resolve(),
-            processor_path=Path(processor_path).expanduser().resolve(),
+            model_path=model_path,
+            processor_path=processor_path,
             device=str(self.device),
             strict=strict,
-            vlm_model_path=Path(vlm_model_path).expanduser().resolve(),
+            vlm_model_path=vlm_model_path,
             embodiment_tag=embodiment_tag,
         )
-        encoder, checkpoint_args, _, _ = load_rl_token_encoder(
-            Path(rl_token_checkpoint).expanduser().resolve(), self.device
+        loaded_encoder = load_serving_rl_token_encoder(
+            encoder_artifact=rl_token_encoder_artifact,
+            legacy_full_checkpoint=legacy_rl_token_checkpoint,
+            expected_checkpoint_fingerprint=expected_checkpoint_fingerprint,
+            expected_cache_fingerprint=expected_cache_fingerprint,
+            cache_contract=cache_contract,
+            device=self.device,
         )
+        encoder = loaded_encoder.encoder
+        checkpoint_args = loaded_encoder.checkpoint_args
         if encoder.config.rl_token_dim != contract.z_dim:
             raise ValueError(
-                f"RL-token checkpoint dim {encoder.config.rl_token_dim} != z_dim {contract.z_dim}"
+                f"RL-token encoder dim {encoder.config.rl_token_dim} != z_dim {contract.z_dim}"
             )
         self.encoder = encoder
-        trained_scope = str(checkpoint_args.get("token_scope", "all"))
-        trained_sampling = str(checkpoint_args.get("token_sampling", "uniform"))
-        trained_max_tokens = int(checkpoint_args.get("max_vl_tokens", encoder.config.max_vl_tokens))
-        if token_scope is not None and token_scope != trained_scope:
+        if token_scope is not None and token_scope != cache_contract.token_scope:
             raise ValueError(
                 f"serving token_scope={token_scope!r} differs from encoder training "
-                f"token_scope={trained_scope!r}"
+                f"token_scope={cache_contract.token_scope!r}"
             )
-        if token_sampling is not None and token_sampling != trained_sampling:
+        if token_sampling is not None and token_sampling != cache_contract.token_sampling:
             raise ValueError(
                 f"serving token_sampling={token_sampling!r} differs from encoder training "
-                f"token_sampling={trained_sampling!r}"
+                f"token_sampling={cache_contract.token_sampling!r}"
             )
-        if max_vl_tokens is not None and int(max_vl_tokens) != trained_max_tokens:
+        if max_vl_tokens is not None and int(max_vl_tokens) != cache_contract.max_vl_tokens:
             raise ValueError(
                 f"serving max_vl_tokens={max_vl_tokens} differs from encoder training "
-                f"max_vl_tokens={trained_max_tokens}"
+                f"max_vl_tokens={cache_contract.max_vl_tokens}"
             )
-        self.token_scope = trained_scope
-        self.token_sampling = trained_sampling
-        self.max_vl_tokens = trained_max_tokens
-        if self.token_sampling == "random":
-            raise ValueError(
-                "token_sampling='random' is not allowed for online serving because it makes "
-                "z_rl non-deterministic and perturbs the flow sampler RNG."
-            )
-        if self.max_vl_tokens > int(encoder.config.max_vl_tokens):
-            raise ValueError(
-                f"max_vl_tokens={self.max_vl_tokens} exceeds encoder capacity "
-                f"{encoder.config.max_vl_tokens}"
-            )
+        self.token_scope = cache_contract.token_scope
+        self.token_sampling = cache_contract.token_sampling
+        self.max_vl_tokens = cache_contract.max_vl_tokens
         backbone_dim = getattr(self.policy.model.config, "backbone_embedding_dim", None)
-        if backbone_dim is not None and int(backbone_dim) != int(encoder.config.input_dim):
+        if backbone_dim is None:
+            raise ValueError("GR00T model config does not expose backbone_embedding_dim")
+        if int(backbone_dim) != int(cache_contract.input_dim):
             raise ValueError(
-                f"RL-token encoder input_dim={encoder.config.input_dim} does not match "
+                f"Prefix-cache input_dim={cache_contract.input_dim} does not match "
                 f"GR00T backbone_embedding_dim={backbone_dim}"
             )
-        trained_vlm_path = checkpoint_args.get("vlm_model_path")
-        serving_vlm_path = Path(vlm_model_path).expanduser().resolve()
-        if trained_vlm_path:
-            trained_vlm = Path(str(trained_vlm_path)).expanduser()
-            if trained_vlm.exists() and not serving_vlm_path.samefile(trained_vlm.resolve()):
-                raise ValueError(
-                    f"RL-token encoder was trained with VLM {trained_vlm.resolve()}, "
-                    f"but serving uses {serving_vlm_path}"
-                )
+        policy_video_keys = tuple(self.policy.modality_configs["video"].modality_keys)
+        if policy_video_keys != cache_contract.video_modality_keys:
+            raise ValueError(
+                f"Serving GR00T video keys={policy_video_keys!r} differ from prefix-cache "
+                f"video keys={cache_contract.video_modality_keys!r}"
+            )
         self.rl_token_checkpoint_args = checkpoint_args
-        self.proprio_keys = proprio_keys
+        self.rl_token_serving_metadata = {
+            **loaded_encoder.handshake,
+            "model_path": str(model_path),
+            "processor_path": str(processor_path),
+            "vlm_model_path": str(vlm_model_path),
+            "vlm_deployment_content_fingerprint": actual_vlm_content_fingerprint,
+            "vlm_fingerprint_scope": "deployment_only_not_representation_training_lineage",
+        }
+        checkpoint_state_keys = tuple(self.policy.modality_configs["state"].modality_keys)
+        if (
+            proprio_keys is None
+            and checkpoint_state_keys == ("eef_9d", "hand_joint_pos", "arm_joint_pos")
+            and contract.proprio_dim == ACTOR_PROPRIO_DIM
+        ):
+            # The complete state still reaches the frozen 400k model. Only this
+            # projected view is advertised to actor/critic consumers.
+            self.proprio_keys = ("eef_9d", "hand_joint_pos")
+        else:
+            self.proprio_keys = proprio_keys
         self.image_key_map = dict(image_key_map or {})
         self.flat_state_layout = flat_state_layout
         self.default_instruction = default_instruction
@@ -238,15 +509,23 @@ class GrootN1d7FeatureBackend:
             self.action_layout = list(VLA_REFERENCE_CHANNEL_NAMES)
             self.rot6d_convention = ROT6D_CONVENTION
         self.proprio_layout: list[str] | None = None
-        if proprio_keys is None:
-            try:
-                state_layout = self._resolved_flat_state_layout()
-            except ValueError:
-                state_layout = None
-            if state_layout is not None:
+        try:
+            state_layout = self._resolved_flat_state_layout()
+        except ValueError:
+            state_layout = None
+        if state_layout is not None:
+            selected_keys = self.proprio_keys or tuple(key for key, _ in state_layout)
+            dimensions = dict(state_layout)
+            if all(key in dimensions for key in selected_keys):
                 self.proprio_layout = [
-                    f"{key}[{index}]" for key, dim in state_layout for index in range(dim)
+                    f"{key}[{index}]" for key in selected_keys for index in range(dimensions[key])
                 ]
+        if (
+            checkpoint_state_keys == ("eef_9d", "hand_joint_pos", "arm_joint_pos")
+            and contract.proprio_dim == ACTOR_PROPRIO_DIM
+            and self.proprio_layout != list(ACTOR_PROPRIO_CHANNEL_NAMES)
+        ):
+            raise ValueError("Nero 19D proprio layout must be exactly eef9+hand10")
         self.action_layout_hash = (
             None
             if self.action_layout is None

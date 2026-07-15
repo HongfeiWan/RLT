@@ -228,6 +228,18 @@ def _run_env_driver(
             connect_timeout_sec=system.env_driver.machine_a_connect_timeout_sec,
             recv_timeout_sec=system.env_driver.machine_a_recv_timeout_sec,
             retry_interval_sec=system.env_driver.machine_a_retry_interval_sec,
+            allow_unpinned_metadata=system.env_driver.machine_a_allow_unpinned_metadata,
+            expected_backend=system.env_driver.machine_a_expected_backend,
+            expected_checkpoint_fingerprint=(
+                system.env_driver.machine_a_expected_checkpoint_fingerprint
+            ),
+            expected_cache_fingerprint=system.env_driver.machine_a_expected_cache_fingerprint,
+            expected_encoder_artifact_sha256=(
+                system.env_driver.machine_a_expected_encoder_artifact_sha256
+            ),
+            expected_vlm_content_fingerprint=(
+                system.env_driver.machine_a_expected_vlm_content_fingerprint
+            ),
         )
 
     human_override_fn = _load_factory(human_override_factory)

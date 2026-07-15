@@ -5,7 +5,9 @@ experiment:
     action_dim: 19
     chunk_len: 10
     z_dim: 2048
-    proprio_dim: 26
+    # The frozen 400k VLA still receives its full 26D state. Actor/critic only
+    # receive the projected EEF9+hand10 proprioception.
+    proprio_dim: 19
 
     # The current exporter emits physical absolute actions. Do not change this
     # to delta_chunk without recomputing statistics in the transformed space.
@@ -93,6 +95,12 @@ runtime:
     # Replace with the GR00T Machine-A address. The literal placeholder should
     # never resolve on a correctly configured network.
     machine_a_ws_url: ws://MACHINE_A_IP:8000
+    machine_a_allow_unpinned_metadata: false
+    machine_a_expected_backend: groot-n1.7
+    machine_a_expected_checkpoint_fingerprint: "sha256:REPLACE_WITH_400K_CHECKPOINT_FINGERPRINT"
+    machine_a_expected_cache_fingerprint: "sha256:REPLACE_WITH_PREFIX_CACHE_FINGERPRINT"
+    machine_a_expected_encoder_artifact_sha256: "sha256:REPLACE_WITH_ENCODER_ARTIFACT_FILE_SHA256"
+    machine_a_expected_vlm_content_fingerprint: "sha256:REPLACE_WITH_VLM_CONTENT_FINGERPRINT"
     actor_service_url: http://127.0.0.1:9101
     replay_service_url: http://127.0.0.1:9102
     task_mode: critical_phase

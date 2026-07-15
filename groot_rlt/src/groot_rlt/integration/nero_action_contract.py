@@ -37,6 +37,13 @@ HAND_ACTION_CHANNEL_NAMES: Final = (
 )
 ARM_REFERENCE_CHANNEL_NAMES: Final = tuple(f"arm_joint_target.{index}" for index in range(7))
 
+# Actor/critic proprioception deliberately excludes arm_joint_pos.  These names
+# match the Machine-A wire layout emitted by GrootN1d7FeatureBackend.
+ACTOR_PROPRIO_CHANNEL_NAMES: Final = (
+    *(f"eef_9d[{index}]" for index in range(9)),
+    *(f"hand_joint_pos[{index}]" for index in range(10)),
+)
+
 # Names written by the Teleop LeRobot v3 exporter. These describe the same
 # physical row-first tensors as the runtime names below; the bridge validates
 # them before assigning the runtime contract names.
@@ -81,6 +88,8 @@ V3_ACTION_DIM: Final = 19
 V3_ARM_STATE_SLICE: Final = slice(0, 7)
 V3_EEF_STATE_SLICE: Final = slice(7, 16)
 V3_HAND_STATE_SLICE: Final = slice(16, 26)
+ACTOR_PROPRIO_DIM: Final = len(ACTOR_PROPRIO_CHANNEL_NAMES)
+V3_TO_ACTOR_PROPRIO_INDICES: Final = tuple(range(7, 26))
 
 
 def semantic_layout_hash(
@@ -152,6 +161,29 @@ def bridge_v3_policy_state_to_machine_a(
         ),
         axis=-1,
     ).astype(np.float32, copy=False)
+
+
+def project_v3_policy_state_to_actor_proprio(
+    state: Any,
+    *,
+    rotation_convention: str,
+) -> np.ndarray:
+    """Project the 26D v3 state onto actor/critic EEF-and-hand proprioception.
+
+    The complete ``arm7 + eef9 + hand10`` state remains the input to the frozen
+    400k VLA.  Only ``eef9 + hand10`` crosses the replay/actor/critic boundary.
+    """
+
+    # Reuse the full checkpoint-input bridge so rotation and finiteness checks
+    # cannot drift between the VLA and actor/critic paths.
+    checkpoint_state = bridge_v3_policy_state_to_machine_a(
+        state,
+        rotation_convention=rotation_convention,
+    )
+    projected = checkpoint_state[..., :ACTOR_PROPRIO_DIM]
+    if projected.shape[-1] != ACTOR_PROPRIO_DIM:  # pragma: no cover - invariant guard.
+        raise RuntimeError("actor proprio projection produced an invalid dimension")
+    return projected.astype(np.float32, copy=True)
 
 
 def bridge_v3_executed_action(

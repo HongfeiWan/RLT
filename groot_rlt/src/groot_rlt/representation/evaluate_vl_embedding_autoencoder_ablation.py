@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from groot_rlt.groot_repo import ensure_groot_repo
+from groot_rlt.integration.artifact_lineage import canonical_json_sha256
 from groot_rlt.paths import VL_EMBEDDING_CACHE_DIR
 
 REPO_ROOT = ensure_groot_repo()
@@ -242,6 +243,59 @@ def print_table(title: str, rows: dict[str, dict[str, float]], ratio_name: str) 
         )
 
 
+def validate_evaluation_cache_contract(
+    cache_dir: Path,
+    checkpoint_args: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the ablation input to the exact direct-prefix cache used for training."""
+
+    manifest_path = cache_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = {
+        "schema_version": 2,
+        "representation_source": "groot_checkpoint_backbone",
+        "feature_tap": "raw_backbone_pre_action_head",
+        "processor_mode": "eval",
+        "token_scope": checkpoint_args.get("token_scope"),
+        "token_sampling": checkpoint_args.get("token_sampling"),
+        "max_vl_tokens": int(checkpoint_args.get("max_vl_tokens", -1)),
+        "cache_dtype": checkpoint_args.get("cache_dtype"),
+        "episode_sampling_rate": float(checkpoint_args.get("episode_sampling_rate", -1.0)),
+        "dataset_sampling_seed": int(checkpoint_args.get("seed", -1)),
+    }
+    mismatches = [
+        f"{key}: cache={manifest.get(key)!r} checkpoint={value!r}"
+        for key, value in expected.items()
+        if manifest.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError("Ablation cache contract mismatch: " + "; ".join(mismatches))
+
+    recorded_fingerprint = manifest.get("fingerprint")
+    material = {key: value for key, value in manifest.items() if key != "fingerprint"}
+    actual_fingerprint = canonical_json_sha256(material)
+    if recorded_fingerprint != actual_fingerprint:
+        raise ValueError(
+            "Ablation cache manifest fingerprint mismatch: "
+            f"recorded={recorded_fingerprint!r} actual={actual_fingerprint!r}"
+        )
+    lineage = checkpoint_args.get("representation_lineage")
+    if not isinstance(lineage, dict):
+        raise ValueError("Ablation checkpoint has no representation_lineage")
+    expected_lineage = {
+        "cache_fingerprint": actual_fingerprint,
+        "checkpoint_fingerprint": manifest.get("checkpoint_fingerprint"),
+        "feature_tap": "raw_backbone_pre_action_head",
+        "processor_mode": "eval",
+    }
+    if lineage != expected_lineage:
+        raise ValueError(
+            "Ablation checkpoint/cache lineage mismatch: "
+            f"checkpoint={lineage!r} cache={expected_lineage!r}"
+        )
+    return manifest
+
+
 def main() -> None:
     args = parse_args()
     device = get_device(args.device)
@@ -256,6 +310,7 @@ def main() -> None:
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     validate_strict_checkpoint_payload(ckpt)
     ckpt_args = dict(ckpt.get("args", {}))
+    cache_manifest = validate_evaluation_cache_contract(cache_dir, ckpt_args)
     autoencoder_config = VLTokenAutoencoderConfig(**ckpt["autoencoder_config"])
     autoencoder = VLTokenAutoencoder(autoencoder_config)
     load_autoencoder_state_dict(autoencoder, ckpt["autoencoder"])
@@ -439,6 +494,8 @@ def main() -> None:
         "checkpoint_step": ckpt_step,
         "checkpoint_last_loss": ckpt_loss,
         "cache_dir": str(cache_dir),
+        "cache_fingerprint": cache_manifest["fingerprint"],
+        "checkpoint_fingerprint": cache_manifest["checkpoint_fingerprint"],
         "device": str(device),
         "autoencoder_bf16": bool(autoencoder_bf16),
         "eval_batches": int(batches),

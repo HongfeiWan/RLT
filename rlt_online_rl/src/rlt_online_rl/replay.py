@@ -6,6 +6,7 @@ import enum
 import http
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
+from itertools import pairwise
 import json
 import logging
 import os
@@ -276,12 +277,9 @@ class RLTTransition:
             raise ValueError("ref_chunk must be zero in padded rows")
         if bool(np.any(self.rewards[padding] != 0.0)):
             raise ValueError("rewards must be zero in padded rows")
-        # Existing online collectors persisted a terminal next reference even
-        # though it is never bootstrapped. Canonicalize masked rows to zero so
-        # those records remain readable without allowing the values into a loss.
-        if bool(np.any(~self.next_reference_valid_mask)):
-            self.next_ref_chunk = self.next_ref_chunk.copy()
-            self.next_ref_chunk[~self.next_reference_valid_mask] = 0.0
+        # Masked next-reference values remain available for audit/parity. The
+        # learner canonicalizes them to zero before either target network sees
+        # them, so terminal collector payloads stay backward compatible.
 
         self.done = bool(self.done)
         self.collection_phase = str(self.collection_phase)
@@ -599,7 +597,7 @@ def _split_contiguous_segments(steps: list[EpisodeStepRecord]) -> list[list[Epis
     # one case, continuity must be established by the remaining metadata.
     step_ids_are_informative = any(step.step_id != 0 for step in steps)
     segments: list[list[EpisodeStepRecord]] = [[steps[0]]]
-    for previous, current in zip(steps, steps[1:], strict=False):
+    for previous, current in pairwise(steps):
         explicit_segment_break = (
             previous.segment_id is not None
             or current.segment_id is not None
