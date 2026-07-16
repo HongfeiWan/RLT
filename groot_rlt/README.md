@@ -84,6 +84,11 @@ retained as compatibility aliases.
 These commands replace the former scripts under
 `Isaac-GR00T/examples/IsaacLab`.
 
+For an accepted training run, follow the repository-level
+[verified GR00T-prefix RLT pipeline](../docs/verified_groot_prefix_rlt_pipeline.md).
+It pins the fine-tuned GR00T prefix source, strict model architecture, training
+configuration, mandatory evaluation gates, and downstream admission rule.
+
 Example two-stage representation training:
 
 ```bash

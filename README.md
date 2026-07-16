@@ -86,6 +86,13 @@ checkout (for example, set it to `/workspace/RLT` in a container).
 The unified command is the recommended entry point. The former
 `groot-rlt-<command>` executables remain available for compatibility.
 
+The canonical, gate-by-gate procedure validated with a fine-tuned GR00T 400k
+checkpoint is documented in the
+[verified GR00T-prefix RLT pipeline](docs/verified_groot_prefix_rlt_pipeline.md).
+Future encoder/decoder runs should use that procedure: the target GR00T
+checkpoint is the prefix source, and v3 replay is admitted only after audit,
+golden parity, ablation, and true-prefix holdout all pass.
+
 ### 1. Train the RL-token representation
 
 ```bash
